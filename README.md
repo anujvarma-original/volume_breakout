@@ -1,70 +1,41 @@
-# Darvas + Minervini Crypto Scanner
+# Darvas + Minervini Market Scanner
 
-A Streamlit dashboard for current-state analysis of Bitcoin and Ethereum.
+A Streamlit dashboard for current-state Darvas-box and Minervini-style analysis.
+
+## Markets
+
+- Bitcoin and Ethereum
+- S&P 500 via SPY or ^GSPC
+- Nasdaq-100 via QQQ or ^NDX
+- On-demand S&P 500 constituent scanning
+- On-demand Nasdaq-100 constituent scanning
 
 ## Included
 
-- BTC-USD and ETH-USD daily modes
 - Configurable Darvas box detection
 - Price and volume breakout confirmation
-- Crypto-adapted Minervini trend template
+- 50-, 150- and 200-day trend template
+- Rising 200-day moving-average test
+- Distance from the 365-day high
 - Dollar-volume dry-up and ATR contraction
-- ETH/BTC relative strength
-- Composite 100-point score
-- Interactive candlestick, moving-average and volume charts
-- CSV export
+- Relative strength versus BTC, SPY or QQQ
+- Composite score out of 100
+- Interactive charts and CSV export
 - No backtesting
 
-## Run locally
-
-```bash
-python -m venv .venv
-```
-
-Activate the environment:
-
-**Windows**
-
-```bash
-.venv\Scripts\activate
-```
-
-**macOS/Linux**
-
-```bash
-source .venv/bin/activate
-```
-
-Install and run:
+## Run
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy to Streamlit Community Cloud
+## Scanner notes
 
-1. Put `app.py` and `requirements.txt` in a GitHub repository.
-2. Open Streamlit Community Cloud.
-3. Select the repository and choose `app.py` as the entry point.
-4. Deploy. No API key is required for the initial yfinance version.
+Choose **S&P 500** or **Nasdaq-100** in the sidebar, then open the **Market Scanner** tab. The default scan limit is 100 symbols. Increase it to scan the full universe. Public market-data services can occasionally rate-limit large scans.
 
-## Signal states
+The Nasdaq market mode uses the Nasdaq-100 rather than all Nasdaq-listed securities.
 
-- **NO VALID BOX**: The selected window fails one or more box rules.
-- **BUILDING A BOX**: A valid box exists, but price is not within 2% of the box high.
-- **BREAKOUT WATCH**: A valid box exists and price is within 2% of the box high.
-- **PRICE BREAKOUT / WEAK VOLUME**: Price broke out, but volume confirmation failed.
-- **CONFIRMED BREAKOUT**: Box, price breakout and volume confirmation all pass.
+## Data caveats
 
-## Important implementation detail
-
-The box is calculated from completed candles ending one candle before the latest
-available candle. The latest candle is then tested independently as the possible
-breakout candle. This prevents the breakout candle itself from raising the box high.
-
-## Data caveat
-
-Yahoo Finance aggregates crypto pricing and volume. It is suitable for a simple
-public-data scanner, but exchange-specific results may differ. Crypto trades
-continuously, and the current UTC daily candle can be incomplete.
+Constituent lists are loaded from public Wikipedia tables. Prices are downloaded through yfinance. The latest daily candle can be incomplete while the relevant market is open; crypto candles can be incomplete before the UTC day closes.
