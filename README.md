@@ -39,3 +39,12 @@ The Nasdaq market mode uses the Nasdaq-100 rather than all Nasdaq-listed securit
 ## Data caveats
 
 Constituent lists are loaded from public Wikipedia tables. Prices are downloaded through yfinance. The latest daily candle can be incomplete while the relevant market is open; crypto candles can be incomplete before the UTC day closes.
+
+
+## Email breakout alerts
+
+The app can send an email when the latest completed candle becomes a **confirmed breakout**: price closes above the buffered box high and volume meets the configured multiple. Duplicate suppression stores the last alert per ticker in `.breakout_alert_state.json`.
+
+Copy `.streamlit_secrets.toml.example` to `.streamlit/secrets.toml` and enter SMTP credentials. For Gmail, use an App Password. Never commit the secrets file to source control.
+
+The app checks for alerts whenever Streamlit reruns. For unattended alerts, deploy the app on an always-running host and configure periodic reruns or an external scheduler.
