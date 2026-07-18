@@ -11,43 +11,23 @@ import yfinance as yf
 
 
 st.set_page_config(
-    page_title="Darvas + Minervini Market Scanner",
+    page_title="Darvas + Minervini Crypto Scanner",
     page_icon="📦",
     layout="wide",
 )
 
 
-ASSET_GROUPS = {
-    "Crypto": {
-        "Bitcoin": "BTC-USD",
-        "Ethereum": "ETH-USD",
-    },
-    "S&P 500": {
-        "S&P 500 ETF (SPY)": "SPY",
-        "S&P 500 Index (^GSPC)": "^GSPC",
-    },
-    "Nasdaq-100": {
-        "Nasdaq-100 ETF (QQQ)": "QQQ",
-        "Nasdaq-100 Index (^NDX)": "^NDX",
-    },
-}
-
-BENCHMARKS = {
-    "Crypto": "BTC-USD",
-    "S&P 500": "SPY",
-    "Nasdaq-100": "QQQ",
-}
-
-UNIVERSE_URLS = {
-    "S&P 500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-    "Nasdaq-100": "https://en.wikipedia.org/wiki/Nasdaq-100",
+CRYPTO_ASSETS = {
+    "Bitcoin": "BTC-USD",
+    "Ethereum": "ETH-USD",
 }
 
 
 @dataclass(frozen=True)
 class Settings:
     history_period: str
-    box_days: int
+    min_base_days: int
+    max_base_days: int
     max_box_range_pct: float
     test_tolerance_pct: float
     minimum_high_tests: int
@@ -135,43 +115,120 @@ def add_indicators(data: pd.DataFrame, settings: Settings) -> pd.DataFrame:
 
 
 def detect_current_box(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
-    """
-    Detect a Darvas-style consolidation using completed candles before the latest candle.
+    """Automatically identify the strongest active Darvas-style base.
 
-    The latest candle is excluded so that it can independently qualify as a breakout.
+    Candidate bases all end on the most recent completed candle. Their starting
+    date varies from ``min_base_days`` to ``max_base_days``. Resistance and
+    support are estimated from clusters of highs and lows, rather than from one
+    isolated extreme candle. The latest candle is evaluated separately as the
+    possible breakout candle.
     """
-    if len(df) < settings.box_days + 2:
-        return {"valid": False, "reason": "Not enough data"}
+    minimum_required = settings.max_base_days + 2
+    if len(df) < minimum_required:
+        return {"valid": False, "reason": f"At least {minimum_required} candles are required"}
 
-    box = df.iloc[-(settings.box_days + 1):-1].copy()
+    completed = df.iloc[:-1].copy()
     latest = df.iloc[-1]
     previous = df.iloc[-2]
-
-    box_high = safe_float(box["High"].max())
-    box_low = safe_float(box["Low"].min())
-    midpoint = (box_high + box_low) / 2
-    range_pct = ((box_high - box_low) / midpoint) * 100 if midpoint else np.nan
-
     tolerance = settings.test_tolerance_pct / 100
-    high_test_level = box_high * (1 - tolerance)
-    low_test_level = box_low * (1 + tolerance)
+    candidates: list[dict[str, Any]] = []
 
-    high_tests = int((box["High"] >= high_test_level).sum())
-    low_tests = int((box["Low"] <= low_test_level).sum())
+    for base_days in range(settings.min_base_days, settings.max_base_days + 1):
+        base = completed.tail(base_days).copy()
+        if len(base) < base_days:
+            continue
 
-    inside_ratio = float(
-        ((box["Close"] <= box_high) & (box["Close"] >= box_low)).mean()
-    )
+        # Use price clusters to keep a one-day wick from defining the box.
+        upper_seed = safe_float(base["High"].quantile(0.85))
+        lower_seed = safe_float(base["Low"].quantile(0.15))
+        upper_cluster = base.loc[base["High"] >= upper_seed, "High"]
+        lower_cluster = base.loc[base["Low"] <= lower_seed, "Low"]
+        box_high = safe_float(upper_cluster.median())
+        box_low = safe_float(lower_cluster.median())
 
-    max_range_pass = range_pct <= settings.max_box_range_pct
-    high_tests_pass = high_tests >= settings.minimum_high_tests
-    low_tests_pass = low_tests >= settings.minimum_low_tests
-    containment_pass = inside_ratio >= 0.90
+        if not np.isfinite(box_high) or not np.isfinite(box_low) or box_high <= box_low:
+            continue
 
-    box_valid = all(
-        [max_range_pass, high_tests_pass, low_tests_pass, containment_pass]
-    )
+        midpoint = (box_high + box_low) / 2
+        range_pct = ((box_high - box_low) / midpoint) * 100
+        high_tests = int((base["High"].sub(box_high).abs() / box_high <= tolerance).sum())
+        low_tests = int((base["Low"].sub(box_low).abs() / box_low <= tolerance).sum())
 
+        # Slight intraday excursions are allowed; closes should remain contained.
+        close_tolerance = max(tolerance, 0.01)
+        upper_close_limit = box_high * (1 + close_tolerance)
+        lower_close_limit = box_low * (1 - close_tolerance)
+        inside_ratio = float(
+            ((base["Close"] <= upper_close_limit) & (base["Close"] >= lower_close_limit)).mean()
+        )
+
+        half = max(3, base_days // 2)
+        early_atr = safe_float(base["ATR_Pct"].head(half).mean())
+        late_atr = safe_float(base["ATR_Pct"].tail(half).mean())
+        atr_contracting = bool(np.isfinite(early_atr) and np.isfinite(late_atr) and late_atr <= early_atr * 1.05)
+
+        range_pass = range_pct <= settings.max_box_range_pct
+        high_tests_pass = high_tests >= settings.minimum_high_tests
+        low_tests_pass = low_tests >= settings.minimum_low_tests
+        containment_pass = inside_ratio >= 0.90
+        valid = all([range_pass, high_tests_pass, low_tests_pass, containment_pass])
+        if not valid:
+            continue
+
+        # Prefer tight, well-tested, contained and volatility-contracting bases.
+        tightness_score = max(0.0, 1 - range_pct / settings.max_box_range_pct)
+        touch_score = min(1.0, (high_tests + low_tests) / 8)
+        length_score = min(1.0, base_days / 40)
+        quality_score = (
+            35 * tightness_score
+            + 25 * touch_score
+            + 20 * inside_ratio
+            + 10 * length_score
+            + (10 if atr_contracting else 0)
+        )
+
+        candidates.append({
+            "base": base,
+            "base_days": base_days,
+            "box_high": box_high,
+            "box_low": box_low,
+            "box_range_pct": range_pct,
+            "high_tests": high_tests,
+            "low_tests": low_tests,
+            "inside_ratio": inside_ratio,
+            "atr_contracting": atr_contracting,
+            "quality_score": quality_score,
+        })
+
+    if not candidates:
+        return {
+            "valid": False,
+            "state": "NO VALID BOX",
+            "reason": "No qualifying base found within the automatic search range",
+            "box_high": np.nan,
+            "box_low": np.nan,
+            "box_range_pct": np.nan,
+            "high_tests": 0,
+            "low_tests": 0,
+            "inside_ratio": 0.0,
+            "breakout_level": np.nan,
+            "latest_close": safe_float(latest["Close"]),
+            "previous_close": safe_float(previous["Close"]),
+            "volume_multiple": np.nan,
+            "price_breakout": False,
+            "volume_breakout": False,
+            "confirmed_breakout": False,
+            "base_days": 0,
+            "quality_score": 0.0,
+            "checks": {},
+        }
+
+    # A small preference for the most recent/tighter nested base is already
+    # captured by tightness; quality decides among all natural base lengths.
+    winner = max(candidates, key=lambda item: item["quality_score"])
+    base = winner["base"]
+    box_high = winner["box_high"]
+    box_low = winner["box_low"]
     breakout_level = box_high * (1 + settings.breakout_buffer_pct / 100)
     near_breakout_floor = box_high * 0.98
 
@@ -183,9 +240,9 @@ def detect_current_box(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
 
     price_breakout = latest_close > breakout_level and previous_close <= breakout_level
     volume_breakout = volume_multiple >= settings.breakout_volume_multiple
-    confirmed_breakout = box_valid and price_breakout and volume_breakout
-    price_only_breakout = box_valid and price_breakout and not volume_breakout
-    breakout_watch = box_valid and not price_breakout and latest_close >= near_breakout_floor
+    confirmed_breakout = price_breakout and volume_breakout
+    price_only_breakout = price_breakout and not volume_breakout
+    breakout_watch = not price_breakout and latest_close >= near_breakout_floor
 
     if confirmed_breakout:
         state = "CONFIRMED BREAKOUT"
@@ -193,20 +250,18 @@ def detect_current_box(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
         state = "PRICE BREAKOUT / WEAK VOLUME"
     elif breakout_watch:
         state = "BREAKOUT WATCH"
-    elif box_valid:
-        state = "BUILDING A BOX"
     else:
-        state = "NO VALID BOX"
+        state = "BUILDING A BOX"
 
     return {
-        "valid": box_valid,
+        "valid": True,
         "state": state,
         "box_high": box_high,
         "box_low": box_low,
-        "box_range_pct": range_pct,
-        "high_tests": high_tests,
-        "low_tests": low_tests,
-        "inside_ratio": inside_ratio,
+        "box_range_pct": winner["box_range_pct"],
+        "high_tests": winner["high_tests"],
+        "low_tests": winner["low_tests"],
+        "inside_ratio": winner["inside_ratio"],
         "breakout_level": breakout_level,
         "latest_close": latest_close,
         "previous_close": previous_close,
@@ -214,16 +269,20 @@ def detect_current_box(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
         "price_breakout": price_breakout,
         "volume_breakout": volume_breakout,
         "confirmed_breakout": confirmed_breakout,
-        "box_start": box.index[0],
-        "box_end": box.index[-1],
+        "box_start": base.index[0],
+        "box_end": base.index[-1],
+        "base_days": winner["base_days"],
+        "quality_score": winner["quality_score"],
+        "atr_contracting": winner["atr_contracting"],
+        "candidate_count": len(candidates),
         "checks": {
-            "Range within limit": max_range_pass,
-            "Enough upper-bound tests": high_tests_pass,
-            "Enough lower-bound tests": low_tests_pass,
-            "At least 90% closes contained": containment_pass,
+            "Range within limit": True,
+            "Enough upper-bound tests": True,
+            "Enough lower-bound tests": True,
+            "At least 90% closes contained": True,
+            "ATR stable or contracting": winner["atr_contracting"],
         },
     }
-
 
 def evaluate_trend_template(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
     latest = df.iloc[-1]
@@ -298,10 +357,9 @@ def evaluate_volume_dry_up(df: pd.DataFrame, settings: Settings) -> dict[str, An
 def evaluate_relative_strength(
     asset_ticker: str,
     asset_df: pd.DataFrame,
-    benchmark_ticker: str,
-    benchmark_df: pd.DataFrame,
+    btc_df: pd.DataFrame,
 ) -> dict[str, Any]:
-    if asset_ticker == benchmark_ticker:
+    if asset_ticker == "BTC-USD":
         returns = {
             "30-day return positive": safe_float(asset_df["Return_30D_Pct"].iloc[-1]) > 0,
             "90-day return positive": safe_float(asset_df["Return_90D_Pct"].iloc[-1]) > 0,
@@ -309,48 +367,45 @@ def evaluate_relative_strength(
         }
         passed = sum(returns.values())
         return {
-            "label": f"{asset_ticker} momentum",
+            "label": "BTC momentum",
             "checks": returns,
             "passed": passed,
             "total": len(returns),
             "ratio_series": None,
             "latest_ratio": np.nan,
-            "ratio_name": None,
         }
 
     aligned = pd.concat(
         [
             asset_df["Close"].rename("Asset"),
-            benchmark_df["Close"].rename("Benchmark"),
+            btc_df["Close"].rename("BTC"),
         ],
         axis=1,
         join="inner",
     ).dropna()
 
-    aligned["Ratio"] = aligned["Asset"] / aligned["Benchmark"]
-    aligned["SMA_50"] = aligned["Ratio"].rolling(50).mean()
-    aligned["SMA_200"] = aligned["Ratio"].rolling(200).mean()
-    aligned["Return_30D"] = aligned["Ratio"].pct_change(30) * 100
-    aligned["Return_90D"] = aligned["Ratio"].pct_change(90) * 100
+    aligned["ETH_BTC"] = aligned["Asset"] / aligned["BTC"]
+    aligned["SMA_50"] = aligned["ETH_BTC"].rolling(50).mean()
+    aligned["SMA_200"] = aligned["ETH_BTC"].rolling(200).mean()
+    aligned["Return_30D"] = aligned["ETH_BTC"].pct_change(30) * 100
+    aligned["Return_90D"] = aligned["ETH_BTC"].pct_change(90) * 100
 
     latest = aligned.iloc[-1]
-    ratio_name = f"{asset_ticker}/{benchmark_ticker}"
     checks = {
-        f"{ratio_name} above 50-day average": latest["Ratio"] > latest["SMA_50"],
-        f"{ratio_name} above 200-day average": latest["Ratio"] > latest["SMA_200"],
-        f"{ratio_name} 30-day return positive": latest["Return_30D"] > 0,
-        f"{ratio_name} 90-day return positive": latest["Return_90D"] > 0,
+        "ETH/BTC above 50-day average": latest["ETH_BTC"] > latest["SMA_50"],
+        "ETH/BTC above 200-day average": latest["ETH_BTC"] > latest["SMA_200"],
+        "ETH/BTC 30-day return positive": latest["Return_30D"] > 0,
+        "ETH/BTC 90-day return positive": latest["Return_90D"] > 0,
     }
 
     passed = sum(bool(value) for value in checks.values())
     return {
-        "label": f"Relative strength versus {benchmark_ticker}",
+        "label": "ETH relative strength vs BTC",
         "checks": checks,
         "passed": passed,
         "total": len(checks),
         "ratio_series": aligned,
-        "latest_ratio": safe_float(latest["Ratio"]),
-        "ratio_name": ratio_name,
+        "latest_ratio": safe_float(latest["ETH_BTC"]),
     }
 
 
@@ -489,149 +544,154 @@ def format_currency(value: float) -> str:
     return f"${value:,.4f}"
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_universe(market: str) -> pd.DataFrame:
-    """Load current S&P 500 or Nasdaq-100 constituents from Wikipedia."""
-    if market == "S&P 500":
-        table = pd.read_html(UNIVERSE_URLS[market])[0]
-        result = table[["Symbol", "Security", "GICS Sector"]].copy()
-        result.columns = ["Ticker", "Company", "Sector"]
-    elif market == "Nasdaq-100":
-        tables = pd.read_html(UNIVERSE_URLS[market])
-        candidates = [t for t in tables if "Ticker" in t.columns and len(t) >= 90]
-        if not candidates:
-            raise ValueError("Could not locate the Nasdaq-100 constituents table.")
-        table = candidates[0]
-        company_col = "Company" if "Company" in table.columns else table.columns[0]
-        result = table[["Ticker", company_col]].copy()
-        result.columns = ["Ticker", "Company"]
-        result["Sector"] = "Nasdaq-100"
-    else:
-        raise ValueError(f"No stock universe is defined for {market}.")
-
-    result["Ticker"] = result["Ticker"].astype(str).str.replace(".", "-", regex=False)
-    return result.drop_duplicates("Ticker").reset_index(drop=True)
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def download_batch_closes(tickers: tuple[str, ...], period: str) -> pd.DataFrame:
-    data = yf.download(
-        list(tickers), period=period, interval="1d", auto_adjust=False,
-        progress=False, threads=True, group_by="column"
+def main() -> None:
+    st.title("📦 Darvas + Minervini Crypto Scanner")
+    st.caption(
+        "A present-state BTC/ETH scanner. It identifies boxes, trend quality, "
+        "volume contraction and breakout conditions; it does not backtest or predict returns."
     )
-    if data.empty:
-        return pd.DataFrame()
-    if isinstance(data.columns, pd.MultiIndex):
-        if "Close" in data.columns.get_level_values(0):
-            return data["Close"].copy()
-    if len(tickers) == 1 and "Close" in data.columns:
-        return data[["Close"]].rename(columns={"Close": tickers[0]})
-    return pd.DataFrame()
 
+    with st.sidebar:
+        st.header("Asset")
+        asset_name = st.selectbox("Cryptocurrency", list(CRYPTO_ASSETS))
+        ticker = CRYPTO_ASSETS[asset_name]
 
-def scan_symbol(
-    ticker: str,
-    company: str,
-    sector: str,
-    settings: Settings,
-    benchmark_ticker: str,
-    benchmark_df: pd.DataFrame,
-) -> dict[str, Any] | None:
-    try:
-        raw = download_market_data(ticker, settings.history_period)
-        if len(raw) < max(221, settings.box_days + 2):
-            return None
-        df = add_indicators(raw, settings)
-        box = detect_current_box(df, settings)
-        trend = evaluate_trend_template(df, settings)
-        dry = evaluate_volume_dry_up(df, settings)
-        rs = evaluate_relative_strength(ticker, df, benchmark_ticker, benchmark_df)
-        score = calculate_score(box, trend, dry, rs)
-        latest = df.iloc[-1]
-        return {
-            "Ticker": ticker,
-            "Company": company,
-            "Sector": sector,
-            "State": box["state"],
-            "Score": score["Total"],
-            "Price": safe_float(latest["Close"]),
-            "Box High": box["box_high"],
-            "Box Low": box["box_low"],
-            "Box Range %": box["box_range_pct"],
-            "Breakout Volume ×": box["volume_multiple"],
-            "Trend Passed": f"{trend['passed']}/{trend['total']}",
-            "Dry-Up": dry["pass"],
-            "RS Passed": f"{rs['passed']}/{rs['total']}",
-            "Distance from 365D High %": trend["distance_from_high_pct"],
-            "Latest Date": df.index[-1].strftime("%Y-%m-%d"),
-        }
-    except Exception:
-        return None
+        st.header("Darvas Box")
+        min_base_days = st.slider("Minimum base length", 10, 40, 15)
+        max_base_days = st.slider("Maximum base length", 30, 150, 90)
+        max_box_range_pct = st.slider("Maximum box range (%)", 3.0, 35.0, 15.0, 0.5)
+        test_tolerance_pct = st.slider("Boundary test tolerance (%)", 0.25, 5.0, 1.5, 0.25)
+        minimum_high_tests = st.slider("Minimum upper-bound tests", 1, 6, 2)
+        minimum_low_tests = st.slider("Minimum lower-bound tests", 1, 6, 2)
 
+        st.header("Breakout")
+        breakout_buffer_pct = st.slider("Breakout buffer (%)", 0.0, 5.0, 0.5, 0.1)
+        breakout_volume_multiple = st.slider(
+            "Minimum volume multiple", 1.0, 5.0, 1.5, 0.1
+        )
 
-def render_asset_analysis(
-    group: str,
-    asset_name: str,
-    ticker: str,
-    settings: Settings,
-) -> None:
-    benchmark_ticker = BENCHMARKS[group]
+        st.header("Volume Dry-Up")
+        dry_up_days = st.slider("Recent dry-up days", 3, 30, 10)
+        baseline_volume_days = st.slider("Baseline volume days", 10, 90, 30)
+        dry_up_ratio_max = st.slider(
+            "Maximum recent/baseline volume ratio", 0.25, 1.0, 0.70, 0.05
+        )
+
+        st.header("Trend")
+        near_high_pct = st.slider("Maximum distance from 365-day high (%)", 5, 50, 25)
+        atr_days = st.slider("ATR period", 5, 30, 14)
+        chart_days = st.slider("Chart history days", 90, 730, 365, 30)
+
+        refresh = st.button("Refresh market data", use_container_width=True)
+        if refresh:
+            st.cache_data.clear()
+
+    settings = Settings(
+        history_period="3y",
+        min_base_days=min_base_days,
+        max_base_days=max_base_days,
+        max_box_range_pct=max_box_range_pct,
+        test_tolerance_pct=test_tolerance_pct,
+        minimum_high_tests=minimum_high_tests,
+        minimum_low_tests=minimum_low_tests,
+        breakout_buffer_pct=breakout_buffer_pct,
+        breakout_volume_multiple=breakout_volume_multiple,
+        dry_up_days=dry_up_days,
+        baseline_volume_days=baseline_volume_days,
+        dry_up_ratio_max=dry_up_ratio_max,
+        atr_days=atr_days,
+        near_high_pct=near_high_pct,
+        chart_days=chart_days,
+    )
+
     try:
         with st.spinner(f"Loading {asset_name} daily candles..."):
             raw_asset = download_market_data(ticker, settings.history_period)
-            raw_benchmark = (
-                raw_asset.copy() if ticker == benchmark_ticker
-                else download_market_data(benchmark_ticker, settings.history_period)
+            raw_btc = (
+                raw_asset.copy()
+                if ticker == "BTC-USD"
+                else download_market_data("BTC-USD", settings.history_period)
             )
     except Exception as exc:
         st.error(f"Could not load market data: {exc}")
-        return
+        st.stop()
 
-    if raw_asset.empty or raw_benchmark.empty:
+    if raw_asset.empty or raw_btc.empty:
         st.error("No market data was returned. Try Refresh market data.")
-        return
+        st.stop()
 
     asset_df = add_indicators(raw_asset, settings)
-    benchmark_df = add_indicators(raw_benchmark, settings)
-    if len(asset_df) < max(221, settings.box_days + 2):
-        st.error("Insufficient daily history for the selected analysis.")
-        return
+    btc_df = add_indicators(raw_btc, settings)
+
+    minimum_rows = max(221, settings.max_base_days + 2)
+    if len(asset_df) < minimum_rows:
+        st.error(f"At least {minimum_rows} daily candles are required.")
+        st.stop()
 
     box_result = detect_current_box(asset_df, settings)
     trend_result = evaluate_trend_template(asset_df, settings)
     dry_up_result = evaluate_volume_dry_up(asset_df, settings)
-    rs_result = evaluate_relative_strength(ticker, asset_df, benchmark_ticker, benchmark_df)
+    rs_result = evaluate_relative_strength(ticker, asset_df, btc_df)
     score = calculate_score(box_result, trend_result, dry_up_result, rs_result)
 
     latest = asset_df.iloc[-1]
     prior = asset_df.iloc[-2]
     daily_change = (latest["Close"] / prior["Close"] - 1) * 100
     latest_date = asset_df.index[-1].strftime("%Y-%m-%d")
-    caveat = (
-        "Crypto candles may be incomplete before the UTC day closes."
-        if group == "Crypto" else
-        "For stocks and ETFs, the latest candle may be incomplete while the U.S. market is open."
+
+    st.info(
+        f"Latest available daily candle: **{latest_date}**. "
+        "Crypto daily candles from the data source may still be incomplete before the UTC day closes."
     )
-    st.info(f"Latest available daily candle: **{latest_date}**. {caveat}")
 
-    metrics = st.columns(6)
-    metrics[0].metric("Price", format_currency(latest["Close"]), f"{daily_change:.2f}%")
-    metrics[1].metric("Strategy Score", f"{score['Total']}/100")
-    metrics[2].metric("State", box_result["state"])
-    metrics[3].metric("Box High", format_currency(box_result["box_high"]))
-    metrics[4].metric("Box Low", format_currency(box_result["box_low"]))
-    metrics[5].metric("Breakout Volume", f"{box_result['volume_multiple']:.2f}×")
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("Price", format_currency(latest["Close"]), f"{daily_change:.2f}%")
+    metric_columns[1].metric("Strategy Score", f"{score['Total']}/100")
+    metric_columns[2].metric("State", box_result["state"])
+    metric_columns[3].metric("Box High", format_currency(box_result["box_high"]))
+    metric_columns[4].metric("Box Low", format_currency(box_result["box_low"]))
+    metric_columns[5].metric(
+        "Breakout Volume",
+        f"{box_result['volume_multiple']:.2f}×"
+        if np.isfinite(box_result["volume_multiple"])
+        else "N/A",
+    )
 
-    tabs = st.tabs(["Overview", "Darvas Box", "Trend Template", "Volume Dry-Up", "Relative Strength", "Raw Data"])
+    tabs = st.tabs(
+        [
+            "Overview",
+            "Darvas Box",
+            "Trend Template",
+            "Volume Dry-Up",
+            "Relative Strength",
+            "Raw Data",
+        ]
+    )
+
     with tabs[0]:
-        st.plotly_chart(make_price_chart(asset_df, box_result, settings, asset_name), use_container_width=True)
-        st.plotly_chart(make_volume_chart(asset_df, settings), use_container_width=True)
+        st.plotly_chart(
+            make_price_chart(asset_df, box_result, settings, asset_name),
+            use_container_width=True,
+        )
+        st.plotly_chart(
+            make_volume_chart(asset_df, settings),
+            use_container_width=True,
+        )
+
         st.subheader("Score Breakdown")
-        st.dataframe(pd.DataFrame([{"Component": k, "Points": v} for k, v in score.items() if k != "Total"]), hide_index=True, use_container_width=True)
+        score_table = pd.DataFrame(
+            [{"Component": key, "Points": value} for key, value in score.items() if key != "Total"]
+        )
+        st.dataframe(score_table, hide_index=True, use_container_width=True)
+
         if box_result["confirmed_breakout"]:
-            st.success("The latest candle meets the configured box, price-breakout and volume-confirmation rules.")
+            st.success(
+                "The latest candle meets the configured box, price-breakout and volume-confirmation rules."
+            )
         elif box_result["state"] == "PRICE BREAKOUT / WEAK VOLUME":
-            st.warning("Price cleared the breakout level, but volume confirmation failed.")
+            st.warning(
+                "Price has cleared the breakout level, but volume has not reached the configured confirmation multiple."
+            )
         elif box_result["state"] == "BREAKOUT WATCH":
             st.warning("Price is within 2% of the current box high.")
         elif box_result["valid"]:
@@ -641,165 +701,172 @@ def render_asset_analysis(
 
     with tabs[1]:
         details = {
-            "Status": box_result["state"], "Box start": box_result["box_start"].strftime("%Y-%m-%d"),
-            "Box end": box_result["box_end"].strftime("%Y-%m-%d"), "Box high": format_currency(box_result["box_high"]),
-            "Box low": format_currency(box_result["box_low"]), "Box range": f"{box_result['box_range_pct']:.2f}%",
-            "Upper-bound tests": box_result["high_tests"], "Lower-bound tests": box_result["low_tests"],
-            "Closes contained": f"{box_result['inside_ratio'] * 100:.1f}%", "Breakout level": format_currency(box_result["breakout_level"]),
-            "Price breakout": "Yes" if box_result["price_breakout"] else "No", "Volume confirmation": "Yes" if box_result["volume_breakout"] else "No",
+            "Status": box_result["state"],
+            "Detected base length": f"{box_result.get('base_days', 0)} days",
+            "Base quality": f"{box_result.get('quality_score', 0):.1f}/100",
+            "Box start": box_result["box_start"].strftime("%Y-%m-%d"),
+            "Box end": box_result["box_end"].strftime("%Y-%m-%d"),
+            "Box high": format_currency(box_result["box_high"]),
+            "Box low": format_currency(box_result["box_low"]),
+            "Box range": f"{box_result['box_range_pct']:.2f}%",
+            "Upper-bound tests": box_result["high_tests"],
+            "Lower-bound tests": box_result["low_tests"],
+            "Closes contained": f"{box_result['inside_ratio'] * 100:.1f}%",
+            "Breakout level": format_currency(box_result["breakout_level"]),
+            "Price breakout": "Yes" if box_result["price_breakout"] else "No",
+            "Volume confirmation": "Yes" if box_result["volume_breakout"] else "No",
         }
-        st.dataframe(pd.DataFrame(details.items(), columns=["Measure", "Value"]), hide_index=True, use_container_width=True)
+        st.dataframe(
+            pd.DataFrame(details.items(), columns=["Measure", "Value"]),
+            hide_index=True,
+            use_container_width=True,
+        )
         render_checks("Box Qualification", box_result["checks"])
 
     with tabs[2]:
-        left, right = st.columns(2)
+        left, right = st.columns([1, 1])
         with left:
-            render_checks(f"Trend Rules: {trend_result['passed']}/{trend_result['total']} Passed", trend_result["checks"])
+            render_checks(
+                f"Trend Rules: {trend_result['passed']}/{trend_result['total']} Passed",
+                trend_result["checks"],
+            )
         with right:
-            st.dataframe(pd.DataFrame([
-                {"Measure": "50-day SMA", "Value": format_currency(trend_result["sma_50"])},
-                {"Measure": "150-day SMA", "Value": format_currency(trend_result["sma_150"])},
-                {"Measure": "200-day SMA", "Value": format_currency(trend_result["sma_200"])},
-                {"Measure": "Distance from 365-day high", "Value": f"{trend_result['distance_from_high_pct']:.2f}%"},
-            ]), hide_index=True, use_container_width=True)
+            trend_values = pd.DataFrame(
+                [
+                    {"Measure": "50-day SMA", "Value": format_currency(trend_result["sma_50"])},
+                    {"Measure": "150-day SMA", "Value": format_currency(trend_result["sma_150"])},
+                    {"Measure": "200-day SMA", "Value": format_currency(trend_result["sma_200"])},
+                    {
+                        "Measure": "Distance from 365-day high",
+                        "Value": f"{trend_result['distance_from_high_pct']:.2f}%",
+                    },
+                ]
+            )
+            st.dataframe(trend_values, hide_index=True, use_container_width=True)
 
     with tabs[3]:
-        st.dataframe(pd.DataFrame([
-            {"Measure": "Recent/baseline dollar-volume ratio", "Value": f"{dry_up_result['ratio']:.2f}"},
-            {"Measure": "Recent average dollar volume", "Value": format_currency(dry_up_result.get("recent_average", np.nan))},
-            {"Measure": "Baseline average dollar volume", "Value": format_currency(dry_up_result.get("baseline_average", np.nan))},
-            {"Measure": "Recent average ATR %", "Value": f"{dry_up_result.get('recent_atr_pct', np.nan):.2f}%"},
-            {"Measure": "Prior average ATR %", "Value": f"{dry_up_result.get('prior_atr_pct', np.nan):.2f}%"},
-            {"Measure": "Volume + ATR dry-up passes", "Value": "Yes" if dry_up_result["pass"] else "No"},
-        ]), hide_index=True, use_container_width=True)
+        dryup_values = pd.DataFrame(
+            [
+                {
+                    "Measure": "Recent/baseline dollar-volume ratio",
+                    "Value": (
+                        f"{dry_up_result['ratio']:.2f}"
+                        if np.isfinite(dry_up_result["ratio"])
+                        else "N/A"
+                    ),
+                },
+                {
+                    "Measure": "Recent average dollar volume",
+                    "Value": format_currency(dry_up_result.get("recent_average", np.nan)),
+                },
+                {
+                    "Measure": "Baseline average dollar volume",
+                    "Value": format_currency(dry_up_result.get("baseline_average", np.nan)),
+                },
+                {
+                    "Measure": "Recent average ATR %",
+                    "Value": f"{dry_up_result.get('recent_atr_pct', np.nan):.2f}%",
+                },
+                {
+                    "Measure": "Prior average ATR %",
+                    "Value": f"{dry_up_result.get('prior_atr_pct', np.nan):.2f}%",
+                },
+                {
+                    "Measure": "Volume + ATR dry-up passes",
+                    "Value": "Yes" if dry_up_result["pass"] else "No",
+                },
+            ]
+        )
+        st.dataframe(dryup_values, hide_index=True, use_container_width=True)
+        st.caption(
+            "Dollar volume is used instead of raw coin volume so BTC and ETH activity is easier to compare."
+        )
 
     with tabs[4]:
-        render_checks(f"{rs_result['label']}: {rs_result['passed']}/{rs_result['total']} Passed", rs_result["checks"])
+        render_checks(
+            f"{rs_result['label']}: {rs_result['passed']}/{rs_result['total']} Passed",
+            rs_result["checks"],
+        )
+
         if rs_result["ratio_series"] is not None:
             ratio = rs_result["ratio_series"].tail(settings.chart_days)
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=ratio.index, y=ratio["Ratio"], mode="lines", name=rs_result["ratio_name"]))
-            fig.add_trace(go.Scatter(x=ratio.index, y=ratio["SMA_50"], mode="lines", name="50-day average"))
-            fig.add_trace(go.Scatter(x=ratio.index, y=ratio["SMA_200"], mode="lines", name="200-day average"))
-            fig.update_layout(title=f"Relative Strength: {rs_result['ratio_name']}", height=450, legend={"orientation": "h"})
+            fig.add_trace(
+                go.Scatter(
+                    x=ratio.index,
+                    y=ratio["ETH_BTC"],
+                    mode="lines",
+                    name="ETH/BTC",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=ratio.index,
+                    y=ratio["SMA_50"],
+                    mode="lines",
+                    name="50-day average",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=ratio.index,
+                    y=ratio["SMA_200"],
+                    mode="lines",
+                    name="200-day average",
+                )
+            )
+            fig.update_layout(
+                title="Ethereum Relative Strength Versus Bitcoin",
+                height=450,
+                yaxis_title="ETH/BTC ratio",
+                legend={"orientation": "h"},
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     with tabs[5]:
-        cols = ["Open", "High", "Low", "Close", "Volume", "Dollar_Volume", "SMA_50", "SMA_150", "SMA_200", "ATR_Pct", "Distance_From_365D_High_Pct"]
-        export = asset_df[cols].copy().sort_index(ascending=False)
+        display_columns = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+            "Dollar_Volume",
+            "SMA_50",
+            "SMA_150",
+            "SMA_200",
+            "ATR_Pct",
+            "Distance_From_365D_High_Pct",
+        ]
+        export = asset_df[display_columns].copy().sort_index(ascending=False)
         st.dataframe(export, use_container_width=True)
-        st.download_button("Download analyzed CSV", export.to_csv().encode("utf-8"), f"{ticker.replace('-', '_').replace('^','')}_darvas_minervini.csv", "text/csv")
+        st.download_button(
+            "Download analyzed CSV",
+            data=export.to_csv().encode("utf-8"),
+            file_name=f"{ticker.replace('-', '_')}_darvas_minervini.csv",
+            mime="text/csv",
+        )
 
+    with st.expander("How the crypto adaptation works"):
+        st.markdown(
+            """
+            - **Dynamic Darvas component:** The app searches every candidate base between the configured
+              minimum and maximum lengths, then selects the strongest current structure. Resistance and
+              support come from clusters of highs and lows, so a single wick does not define the box.
+            - **Breakout:** The latest close must exceed the prior box high plus a buffer.
+              Volume confirmation compares the latest coin volume with the previous 20 completed days.
+            - **Minervini-style trend template:** Uses 50-, 150- and 200-day averages, a rising
+              200-day average, the 365-day range midpoint and distance from the 365-day high.
+            - **Volume dry-up:** Compares recent average USD trading volume with an earlier baseline
+              and also requires average ATR percentage to contract.
+            - **Relative strength:** Ethereum is evaluated against Bitcoin through ETH/BTC.
+              Bitcoin uses positive 30-, 90- and 180-day momentum because it is the benchmark asset.
+            """
+        )
 
-def render_universe_scanner(market: str, settings: Settings) -> None:
-    st.subheader(f"{market} Constituent Scanner")
-    st.caption("The scan runs only when you press the button. Results are current-state signals, not backtests.")
-
-    try:
-        universe = load_universe(market)
-    except Exception as exc:
-        st.error(f"Could not load the {market} constituent list: {exc}")
-        return
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        states = st.multiselect("States to display", ["CONFIRMED BREAKOUT", "PRICE BREAKOUT / WEAK VOLUME", "BREAKOUT WATCH", "BUILDING A BOX", "NO VALID BOX"], default=["CONFIRMED BREAKOUT", "PRICE BREAKOUT / WEAK VOLUME", "BREAKOUT WATCH", "BUILDING A BOX"])
-    with c2:
-        minimum_score = st.slider("Minimum score", 0, 100, 55)
-    with c3:
-        scan_limit = st.number_input("Maximum symbols to scan", 10, len(universe), min(len(universe), 100), 10)
-
-    st.caption(f"Universe currently contains {len(universe)} symbols. Increase the limit to scan the full universe; free data downloads can take longer or occasionally rate-limit.")
-    key = f"scan_results_{market}"
-    if st.button(f"Scan {market}", type="primary", use_container_width=True):
-        benchmark_ticker = BENCHMARKS[market]
-        raw_benchmark = download_market_data(benchmark_ticker, settings.history_period)
-        benchmark_df = add_indicators(raw_benchmark, settings)
-        rows = []
-        progress = st.progress(0)
-        status = st.empty()
-        subset = universe.head(int(scan_limit))
-        for i, record in subset.iterrows():
-            status.write(f"Scanning {record['Ticker']} — {i + 1} of {len(subset)}")
-            row = scan_symbol(record["Ticker"], record["Company"], record["Sector"], settings, benchmark_ticker, benchmark_df)
-            if row:
-                rows.append(row)
-            progress.progress((i + 1) / len(subset))
-        status.empty(); progress.empty()
-        st.session_state[key] = pd.DataFrame(rows)
-
-    results = st.session_state.get(key)
-    if isinstance(results, pd.DataFrame) and not results.empty:
-        filtered = results[(results["Score"] >= minimum_score) & (results["State"].isin(states))].copy()
-        filtered = filtered.sort_values(["Score", "State", "Ticker"], ascending=[False, True, True])
-        st.metric("Matching candidates", len(filtered), f"of {len(results)} successfully analyzed")
-        st.dataframe(filtered, hide_index=True, use_container_width=True, column_config={
-            "Price": st.column_config.NumberColumn(format="$%.2f"),
-            "Box High": st.column_config.NumberColumn(format="$%.2f"),
-            "Box Low": st.column_config.NumberColumn(format="$%.2f"),
-            "Box Range %": st.column_config.NumberColumn(format="%.2f%%"),
-            "Breakout Volume ×": st.column_config.NumberColumn(format="%.2fx"),
-            "Distance from 365D High %": st.column_config.NumberColumn(format="%.2f%%"),
-        })
-        st.download_button(f"Download {market} scan CSV", filtered.to_csv(index=False).encode("utf-8"), f"{market.lower().replace(' ','_').replace('&','and')}_darvas_minervini_scan.csv", "text/csv")
-    elif isinstance(results, pd.DataFrame):
-        st.warning("The scan completed, but no symbols were successfully analyzed.")
-
-
-def main() -> None:
-    st.title("📦 Darvas + Minervini Market Scanner")
-    st.caption("Current-state analysis for BTC, ETH, S&P 500 and Nasdaq-100 markets. No backtesting and no return prediction.")
-
-    with st.sidebar:
-        st.header("Market")
-        group = st.selectbox("Market mode", list(ASSET_GROUPS))
-        asset_name = st.selectbox("Asset or index", list(ASSET_GROUPS[group]))
-        ticker = ASSET_GROUPS[group][asset_name]
-
-        st.header("Darvas Box")
-        default_range = 15.0 if group == "Crypto" else 12.0
-        box_days = st.slider("Box lookback days", 10, 90, 30)
-        max_box_range_pct = st.slider("Maximum box range (%)", 3.0, 35.0, default_range, 0.5)
-        test_tolerance_pct = st.slider("Boundary test tolerance (%)", 0.25, 5.0, 1.5, 0.25)
-        minimum_high_tests = st.slider("Minimum upper-bound tests", 1, 6, 2)
-        minimum_low_tests = st.slider("Minimum lower-bound tests", 1, 6, 2)
-
-        st.header("Breakout")
-        breakout_buffer_pct = st.slider("Breakout buffer (%)", 0.0, 5.0, 0.5, 0.1)
-        breakout_volume_multiple = st.slider("Minimum volume multiple", 1.0, 5.0, 1.5, 0.1)
-
-        st.header("Volume Dry-Up")
-        dry_up_days = st.slider("Recent dry-up days", 3, 30, 10)
-        baseline_volume_days = st.slider("Baseline volume days", 10, 90, 30)
-        dry_up_ratio_max = st.slider("Maximum recent/baseline volume ratio", 0.25, 1.0, 0.70, 0.05)
-
-        st.header("Trend")
-        near_high_pct = st.slider("Maximum distance from 365-day high (%)", 5, 50, 25)
-        atr_days = st.slider("ATR period", 5, 30, 14)
-        chart_days = st.slider("Chart history days", 90, 730, 365, 30)
-        if st.button("Refresh market data", use_container_width=True):
-            st.cache_data.clear()
-
-    settings = Settings("3y", box_days, max_box_range_pct, test_tolerance_pct, minimum_high_tests, minimum_low_tests, breakout_buffer_pct, breakout_volume_multiple, dry_up_days, baseline_volume_days, dry_up_ratio_max, atr_days, near_high_pct, chart_days)
-
-    analysis_tab, scanner_tab = st.tabs(["Asset / Index Analysis", "Market Scanner"])
-    with analysis_tab:
-        render_asset_analysis(group, asset_name, ticker, settings)
-    with scanner_tab:
-        if group == "Crypto":
-            st.info("The market scanner is available for the S&P 500 and Nasdaq-100 modes. BTC and ETH remain available in the analysis tab.")
-        else:
-            render_universe_scanner(group, settings)
-
-    with st.expander("Methodology and limitations"):
-        st.markdown("""
-        - The Darvas box uses completed candles before the latest candle; the latest candle is evaluated independently as the possible breakout.
-        - The Minervini-style trend template uses 50-, 150- and 200-day averages, a rising 200-day average, the 365-day range midpoint and distance from the 365-day high.
-        - S&P 500 stocks are compared with SPY. Nasdaq-100 stocks are compared with QQQ. Ethereum is compared with Bitcoin.
-        - Volume dry-up uses recent dollar volume versus an earlier baseline and also requires ATR percentage contraction.
-        - The scanner downloads public market data on demand. Constituents and market data can occasionally fail or be rate-limited.
-        """)
-    st.caption("Educational scanner only—not investment advice. Signals can fail and market data may be delayed or incomplete.")
+    st.caption(
+        "Educational scanner only—not investment advice. Signals can fail, volume data varies by source, "
+        "and the current UTC daily candle may be incomplete."
+    )
 
 
 if __name__ == "__main__":

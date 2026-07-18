@@ -12,7 +12,7 @@ A Streamlit dashboard for current-state Darvas-box and Minervini-style analysis.
 
 ## Included
 
-- Configurable Darvas box detection
+- Automatic dynamic Darvas base detection
 - Price and volume breakout confirmation
 - 50-, 150- and 200-day trend template
 - Rising 200-day moving-average test
