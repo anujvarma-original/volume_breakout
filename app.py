@@ -1,729 +1,788 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
-from io import StringIO
+from typing import Any
 
 import numpy as np
 import pandas as pd
-import requests
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
 
 st.set_page_config(
-    page_title="S&P 500 Volume Breakout Scanner",
-    page_icon="📈",
+    page_title="Darvas + Minervini Crypto Scanner",
+    page_icon="📦",
     layout="wide",
 )
 
-SP500_CSV_URL = (
-    "https://raw.githubusercontent.com/datasets/"
-    "s-and-p-500-companies/main/data/constituents.csv"
-)
+
+CRYPTO_ASSETS = {
+    "Bitcoin": "BTC-USD",
+    "Ethereum": "ETH-USD",
+}
 
 
 @dataclass(frozen=True)
-class ScannerConfig:
-    quiet_days: int
-    baseline_days: int
-    recent_days: int
-    spike_multiplier: float
-    quiet_ratio: float
-    low_day_fraction: float
-    max_quiet_cv: float
-    min_median_volume: int
-    require_price_breakout: bool
-    require_bullish_candle: bool
-    batch_size: int
-    pause_seconds: float
+class Settings:
+    history_period: str
+    box_days: int
+    max_box_range_pct: float
+    test_tolerance_pct: float
+    minimum_high_tests: int
+    minimum_low_tests: int
+    breakout_buffer_pct: float
+    breakout_volume_multiple: float
+    dry_up_days: int
+    baseline_volume_days: int
+    dry_up_ratio_max: float
+    atr_days: int
+    near_high_pct: float
+    chart_days: int
 
 
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def load_sp500_constituents() -> pd.DataFrame:
-    """Load the current S&P 500 constituent list."""
-    response = requests.get(SP500_CSV_URL, timeout=30)
-    response.raise_for_status()
-
-    frame = pd.read_csv(StringIO(response.text))
-
-    required = {"Symbol", "Security", "GICS Sector"}
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"Constituent file is missing columns: {sorted(missing)}")
-
-    frame = frame.rename(
-        columns={
-            "Symbol": "Ticker",
-            "Security": "Company",
-            "GICS Sector": "Sector",
-        }
-    )
-
-    frame["Ticker"] = (
-        frame["Ticker"]
-        .astype(str)
-        .str.strip()
-        .str.replace(".", "-", regex=False)
-    )
-
-    return (
-        frame[["Ticker", "Company", "Sector"]]
-        .drop_duplicates("Ticker")
-        .sort_values("Ticker")
-        .reset_index(drop=True)
-    )
+def safe_float(value: Any, default: float = np.nan) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
-def download_batch(tickers: list[str], period: str = "6mo") -> pd.DataFrame:
-    """Download one batch without caching partial failures."""
-    return yf.download(
-        tickers=tickers,
+@st.cache_data(ttl=900, show_spinner=False)
+def download_market_data(ticker: str, period: str) -> pd.DataFrame:
+    """Download daily OHLCV data and normalize yfinance output."""
+    data = yf.download(
+        ticker,
         period=period,
         interval="1d",
-        group_by="ticker",
         auto_adjust=False,
-        actions=False,
-        threads=True,
         progress=False,
-        timeout=30,
+        threads=False,
     )
 
+    if data.empty:
+        return pd.DataFrame()
 
-def extract_ticker_frame(
-    downloaded: pd.DataFrame,
-    ticker: str,
-    batch_length: int,
-) -> pd.DataFrame:
-    """Extract and normalize one ticker from a yfinance batch response."""
-    if downloaded is None or downloaded.empty:
-        raise ValueError("No data returned")
-
-    if batch_length == 1:
-        frame = downloaded.copy()
-    else:
-        if not isinstance(downloaded.columns, pd.MultiIndex):
-            raise ValueError("Unexpected multi-ticker response format")
-
-        level_zero = downloaded.columns.get_level_values(0)
-        if ticker not in level_zero:
-            raise ValueError("Ticker missing from batch response")
-
-        frame = downloaded[ticker].copy()
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
 
     required = ["Open", "High", "Low", "Close", "Volume"]
-    missing = set(required).difference(frame.columns)
+    missing = [column for column in required if column not in data.columns]
     if missing:
-        raise ValueError(f"Missing OHLCV columns: {sorted(missing)}")
+        raise ValueError(f"Missing columns from market data: {', '.join(missing)}")
 
-    frame = frame[required].copy()
-    frame = frame.dropna(subset=required)
-    frame = frame[frame["Volume"] > 0]
-    frame.index = pd.to_datetime(frame.index).tz_localize(None)
-    frame = frame.sort_index()
-
-    if frame.empty:
-        raise ValueError("No usable OHLCV rows")
-
-    return frame
+    data = data[required].copy()
+    data.index = pd.to_datetime(data.index).tz_localize(None)
+    data = data.apply(pd.to_numeric, errors="coerce").dropna(subset=["Open", "High", "Low", "Close"])
+    data["Volume"] = data["Volume"].fillna(0)
+    return data
 
 
-def quiet_metrics(
-    quiet_window: pd.DataFrame,
-    baseline_window: pd.DataFrame,
-) -> dict[str, float]:
-    quiet_median = float(quiet_window["Volume"].median())
-    baseline_median = float(baseline_window["Volume"].median())
-    quiet_mean = float(quiet_window["Volume"].mean())
-    quiet_std = float(quiet_window["Volume"].std(ddof=0))
+def add_indicators(data: pd.DataFrame, settings: Settings) -> pd.DataFrame:
+    df = data.copy()
+
+    for length in (20, 50, 150, 200):
+        df[f"SMA_{length}"] = df["Close"].rolling(length).mean()
+
+    prior_close = df["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prior_close).abs(),
+            (df["Low"] - prior_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    df["TR"] = true_range
+    df["ATR"] = true_range.rolling(settings.atr_days).mean()
+    df["ATR_Pct"] = (df["ATR"] / df["Close"]) * 100
+
+    df["Volume_Avg_20"] = df["Volume"].rolling(20).mean()
+    df["Dollar_Volume"] = df["Close"] * df["Volume"]
+    df["Dollar_Volume_Avg_20"] = df["Dollar_Volume"].rolling(20).mean()
+
+    df["High_365"] = df["High"].rolling(365, min_periods=180).max()
+    df["Low_365"] = df["Low"].rolling(365, min_periods=180).min()
+    df["Distance_From_365D_High_Pct"] = ((df["High_365"] - df["Close"]) / df["High_365"]) * 100
+
+    df["Return_30D_Pct"] = df["Close"].pct_change(30) * 100
+    df["Return_90D_Pct"] = df["Close"].pct_change(90) * 100
+    df["Return_180D_Pct"] = df["Close"].pct_change(180) * 100
+
+    return df
+
+
+def detect_current_box(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
+    """
+    Detect a Darvas-style consolidation using completed candles before the latest candle.
+
+    The latest candle is excluded so that it can independently qualify as a breakout.
+    """
+    if len(df) < settings.box_days + 2:
+        return {"valid": False, "reason": "Not enough data"}
+
+    box = df.iloc[-(settings.box_days + 1):-1].copy()
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    box_high = safe_float(box["High"].max())
+    box_low = safe_float(box["Low"].min())
+    midpoint = (box_high + box_low) / 2
+    range_pct = ((box_high - box_low) / midpoint) * 100 if midpoint else np.nan
+
+    tolerance = settings.test_tolerance_pct / 100
+    high_test_level = box_high * (1 - tolerance)
+    low_test_level = box_low * (1 + tolerance)
+
+    high_tests = int((box["High"] >= high_test_level).sum())
+    low_tests = int((box["Low"] <= low_test_level).sum())
+
+    inside_ratio = float(
+        ((box["Close"] <= box_high) & (box["Close"] >= box_low)).mean()
+    )
+
+    max_range_pass = range_pct <= settings.max_box_range_pct
+    high_tests_pass = high_tests >= settings.minimum_high_tests
+    low_tests_pass = low_tests >= settings.minimum_low_tests
+    containment_pass = inside_ratio >= 0.90
+
+    box_valid = all(
+        [max_range_pass, high_tests_pass, low_tests_pass, containment_pass]
+    )
+
+    breakout_level = box_high * (1 + settings.breakout_buffer_pct / 100)
+    near_breakout_floor = box_high * 0.98
+
+    latest_close = safe_float(latest["Close"])
+    previous_close = safe_float(previous["Close"])
+    latest_volume = safe_float(latest["Volume"], 0.0)
+    average_volume = safe_float(df["Volume"].iloc[-21:-1].mean(), 0.0)
+    volume_multiple = latest_volume / average_volume if average_volume > 0 else np.nan
+
+    price_breakout = latest_close > breakout_level and previous_close <= breakout_level
+    volume_breakout = volume_multiple >= settings.breakout_volume_multiple
+    confirmed_breakout = box_valid and price_breakout and volume_breakout
+    price_only_breakout = box_valid and price_breakout and not volume_breakout
+    breakout_watch = box_valid and not price_breakout and latest_close >= near_breakout_floor
+
+    if confirmed_breakout:
+        state = "CONFIRMED BREAKOUT"
+    elif price_only_breakout:
+        state = "PRICE BREAKOUT / WEAK VOLUME"
+    elif breakout_watch:
+        state = "BREAKOUT WATCH"
+    elif box_valid:
+        state = "BUILDING A BOX"
+    else:
+        state = "NO VALID BOX"
 
     return {
-        "quiet_median": quiet_median,
-        "baseline_median": baseline_median,
-        "quiet_ratio": (
-            quiet_median / baseline_median if baseline_median > 0 else np.inf
-        ),
-        "low_day_fraction": float(
-            (quiet_window["Volume"] < baseline_median).mean()
-        ),
-        "quiet_cv": quiet_std / quiet_mean if quiet_mean > 0 else np.inf,
+        "valid": box_valid,
+        "state": state,
+        "box_high": box_high,
+        "box_low": box_low,
+        "box_range_pct": range_pct,
+        "high_tests": high_tests,
+        "low_tests": low_tests,
+        "inside_ratio": inside_ratio,
+        "breakout_level": breakout_level,
+        "latest_close": latest_close,
+        "previous_close": previous_close,
+        "volume_multiple": volume_multiple,
+        "price_breakout": price_breakout,
+        "volume_breakout": volume_breakout,
+        "confirmed_breakout": confirmed_breakout,
+        "box_start": box.index[0],
+        "box_end": box.index[-1],
+        "checks": {
+            "Range within limit": max_range_pass,
+            "Enough upper-bound tests": high_tests_pass,
+            "Enough lower-bound tests": low_tests_pass,
+            "At least 90% closes contained": containment_pass,
+        },
     }
 
 
-def is_quiet_setup(metrics: dict[str, float], config: ScannerConfig) -> bool:
-    return (
-        metrics["quiet_median"] >= config.min_median_volume
-        and metrics["quiet_ratio"] <= config.quiet_ratio
-        and metrics["low_day_fraction"] >= config.low_day_fraction
-        and metrics["quiet_cv"] <= config.max_quiet_cv
-    )
+def evaluate_trend_template(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
+    latest = df.iloc[-1]
 
+    close = safe_float(latest["Close"])
+    sma_50 = safe_float(latest["SMA_50"])
+    sma_150 = safe_float(latest["SMA_150"])
+    sma_200 = safe_float(latest["SMA_200"])
+    high_365 = safe_float(latest["High_365"])
+    low_365 = safe_float(latest["Low_365"])
 
-def analyze_recent_spikes(
-    ticker: str,
-    company: str,
-    sector: str,
-    frame: pd.DataFrame,
-    config: ScannerConfig,
-) -> list[dict]:
-    """
-    Test each of the latest N sessions independently.
+    sma_200_20_days_ago = safe_float(df["SMA_200"].iloc[-21]) if len(df) >= 221 else np.nan
+    midpoint_365 = (high_365 + low_365) / 2 if np.isfinite(high_365) and np.isfinite(low_365) else np.nan
+    distance_from_high = ((high_365 - close) / high_365) * 100 if high_365 else np.nan
 
-    For every candidate spike date, the quiet and baseline windows are taken
-    from dates strictly before that candle. This prevents look-ahead bias.
-    """
-    results: list[dict] = []
-    minimum_rows = config.baseline_days + config.quiet_days + config.recent_days
+    checks = {
+        "Price above 50-day SMA": close > sma_50,
+        "Price above 150-day SMA": close > sma_150,
+        "Price above 200-day SMA": close > sma_200,
+        "50-day SMA above 150-day SMA": sma_50 > sma_150,
+        "150-day SMA above 200-day SMA": sma_150 > sma_200,
+        "200-day SMA rising": sma_200 > sma_200_20_days_ago,
+        "Price above 365-day midpoint": close > midpoint_365,
+        f"Within {settings.near_high_pct:.0f}% of 365-day high": distance_from_high <= settings.near_high_pct,
+    }
 
-    if len(frame) < minimum_rows:
-        return results
-
-    first_candidate = len(frame) - config.recent_days
-
-    for spike_position in range(first_candidate, len(frame)):
-        quiet_end = spike_position
-        quiet_start = quiet_end - config.quiet_days
-        baseline_end = quiet_start
-        baseline_start = baseline_end - config.baseline_days
-
-        if baseline_start < 0:
-            continue
-
-        baseline = frame.iloc[baseline_start:baseline_end]
-        quiet = frame.iloc[quiet_start:quiet_end]
-        spike = frame.iloc[spike_position]
-
-        metrics = quiet_metrics(quiet, baseline)
-        if not is_quiet_setup(metrics, config):
-            continue
-
-        volume_multiple = (
-            float(spike["Volume"]) / metrics["quiet_median"]
-            if metrics["quiet_median"] > 0
-            else 0.0
-        )
-
-        if volume_multiple < config.spike_multiplier:
-            continue
-
-        quiet_high = float(quiet["High"].max())
-        price_breakout = float(spike["Close"]) > quiet_high
-        bullish = float(spike["Close"]) > float(spike["Open"])
-
-        if config.require_price_breakout and not price_breakout:
-            continue
-        if config.require_bullish_candle and not bullish:
-            continue
-
-        candle_range = float(spike["High"] - spike["Low"])
-        body = abs(float(spike["Close"] - spike["Open"]))
-
-        results.append(
-            {
-                "Ticker": ticker,
-                "Company": company,
-                "Sector": sector,
-                "Spike Date": frame.index[spike_position].date(),
-                "Trading Days Ago": len(frame) - 1 - spike_position,
-                "Volume Multiple": round(volume_multiple, 2),
-                "Spike Volume": int(spike["Volume"]),
-                "Quiet Median Volume": int(metrics["quiet_median"]),
-                "Quiet/Baseline Ratio": round(metrics["quiet_ratio"], 3),
-                "Low-Volume Days %": round(
-                    metrics["low_day_fraction"] * 100, 1
-                ),
-                "Quiet Volume CV": round(metrics["quiet_cv"], 3),
-                "Open": round(float(spike["Open"]), 2),
-                "High": round(float(spike["High"]), 2),
-                "Low": round(float(spike["Low"]), 2),
-                "Close": round(float(spike["Close"]), 2),
-                "Candle Change %": round(
-                    (float(spike["Close"]) / float(spike["Open"]) - 1) * 100,
-                    2,
-                ),
-                "Bullish Candle": bullish,
-                "Price Breakout": price_breakout,
-                "Close vs Quiet High %": round(
-                    (float(spike["Close"]) / quiet_high - 1) * 100,
-                    2,
-                ),
-                "Body/Range": round(body / candle_range, 3)
-                if candle_range > 0
-                else 0.0,
-            }
-        )
-
-    return results
-
-
-def analyze_current_quiet_setup(
-    ticker: str,
-    company: str,
-    sector: str,
-    frame: pd.DataFrame,
-    config: ScannerConfig,
-) -> dict | None:
-    """Check whether the latest completed sessions are still in a quiet setup."""
-    required_rows = config.baseline_days + config.quiet_days
-    if len(frame) < required_rows:
-        return None
-
-    quiet = frame.iloc[-config.quiet_days:]
-    baseline = frame.iloc[
-        -(config.baseline_days + config.quiet_days):-config.quiet_days
-    ]
-
-    metrics = quiet_metrics(quiet, baseline)
-    if not is_quiet_setup(metrics, config):
-        return None
-
-    latest = frame.iloc[-1]
-    recent_max_multiple = float(
-        (quiet["Volume"] / metrics["quiet_median"]).max()
-    )
-
-    # "Still quiet" means the current quiet window itself has not already
-    # produced a candle meeting the configured huge-spike threshold.
-    if recent_max_multiple >= config.spike_multiplier:
-        return None
-
-    quiet_high = float(quiet["High"].max())
-    latest_close = float(latest["Close"])
-
+    passed = sum(bool(value) for value in checks.values())
     return {
-        "Ticker": ticker,
-        "Company": company,
-        "Sector": sector,
-        "Latest Date": frame.index[-1].date(),
-        "Latest Close": round(latest_close, 2),
-        "Latest Volume": int(latest["Volume"]),
-        "Quiet Median Volume": int(metrics["quiet_median"]),
-        "Latest Volume Multiple": round(
-            float(latest["Volume"]) / metrics["quiet_median"], 2
-        ),
-        "Quiet/Baseline Ratio": round(metrics["quiet_ratio"], 3),
-        "Low-Volume Days %": round(metrics["low_day_fraction"] * 100, 1),
-        "Quiet Volume CV": round(metrics["quiet_cv"], 3),
-        "Quiet Range High": round(quiet_high, 2),
-        "Distance to Quiet High %": round(
-            (quiet_high / latest_close - 1) * 100, 2
-        )
-        if latest_close > 0
-        else np.nan,
+        "checks": checks,
+        "passed": passed,
+        "total": len(checks),
+        "pass_pct": passed / len(checks) * 100,
+        "distance_from_high_pct": distance_from_high,
+        "sma_50": sma_50,
+        "sma_150": sma_150,
+        "sma_200": sma_200,
     }
 
 
-def run_scan(
-    constituents: pd.DataFrame,
-    config: ScannerConfig,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    breakout_rows: list[dict] = []
-    quiet_rows: list[dict] = []
-    error_rows: list[dict] = []
+def evaluate_volume_dry_up(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
+    if len(df) < settings.baseline_volume_days + settings.dry_up_days + 2:
+        return {"pass": False, "ratio": np.nan}
 
-    progress = st.progress(0, text="Preparing scan...")
-    status = st.empty()
+    # Exclude the latest candle because it might be the breakout candle.
+    completed = df.iloc[:-1]
+    recent = completed["Dollar_Volume"].tail(settings.dry_up_days)
+    baseline_end = len(completed) - settings.dry_up_days
+    baseline_start = max(0, baseline_end - settings.baseline_volume_days)
+    baseline = completed["Dollar_Volume"].iloc[baseline_start:baseline_end]
 
-    tickers = constituents["Ticker"].tolist()
-    lookup = constituents.set_index("Ticker")
-    batches = [
-        tickers[i:i + config.batch_size]
-        for i in range(0, len(tickers), config.batch_size)
-    ]
+    recent_average = safe_float(recent.mean())
+    baseline_average = safe_float(baseline.mean())
+    ratio = recent_average / baseline_average if baseline_average > 0 else np.nan
 
-    processed = 0
+    recent_atr = safe_float(completed["ATR_Pct"].tail(settings.dry_up_days).mean())
+    prior_atr = safe_float(
+        completed["ATR_Pct"].iloc[baseline_start:baseline_end].mean()
+    )
+    atr_contracting = recent_atr < prior_atr if np.isfinite(prior_atr) else False
 
-    for batch_number, batch in enumerate(batches, start=1):
-        status.write(
-            f"Downloading batch {batch_number} of {len(batches)} "
-            f"({len(batch)} stocks)"
+    return {
+        "pass": bool(ratio <= settings.dry_up_ratio_max and atr_contracting),
+        "ratio": ratio,
+        "recent_average": recent_average,
+        "baseline_average": baseline_average,
+        "recent_atr_pct": recent_atr,
+        "prior_atr_pct": prior_atr,
+        "atr_contracting": atr_contracting,
+    }
+
+
+def evaluate_relative_strength(
+    asset_ticker: str,
+    asset_df: pd.DataFrame,
+    btc_df: pd.DataFrame,
+) -> dict[str, Any]:
+    if asset_ticker == "BTC-USD":
+        returns = {
+            "30-day return positive": safe_float(asset_df["Return_30D_Pct"].iloc[-1]) > 0,
+            "90-day return positive": safe_float(asset_df["Return_90D_Pct"].iloc[-1]) > 0,
+            "180-day return positive": safe_float(asset_df["Return_180D_Pct"].iloc[-1]) > 0,
+        }
+        passed = sum(returns.values())
+        return {
+            "label": "BTC momentum",
+            "checks": returns,
+            "passed": passed,
+            "total": len(returns),
+            "ratio_series": None,
+            "latest_ratio": np.nan,
+        }
+
+    aligned = pd.concat(
+        [
+            asset_df["Close"].rename("Asset"),
+            btc_df["Close"].rename("BTC"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+
+    aligned["ETH_BTC"] = aligned["Asset"] / aligned["BTC"]
+    aligned["SMA_50"] = aligned["ETH_BTC"].rolling(50).mean()
+    aligned["SMA_200"] = aligned["ETH_BTC"].rolling(200).mean()
+    aligned["Return_30D"] = aligned["ETH_BTC"].pct_change(30) * 100
+    aligned["Return_90D"] = aligned["ETH_BTC"].pct_change(90) * 100
+
+    latest = aligned.iloc[-1]
+    checks = {
+        "ETH/BTC above 50-day average": latest["ETH_BTC"] > latest["SMA_50"],
+        "ETH/BTC above 200-day average": latest["ETH_BTC"] > latest["SMA_200"],
+        "ETH/BTC 30-day return positive": latest["Return_30D"] > 0,
+        "ETH/BTC 90-day return positive": latest["Return_90D"] > 0,
+    }
+
+    passed = sum(bool(value) for value in checks.values())
+    return {
+        "label": "ETH relative strength vs BTC",
+        "checks": checks,
+        "passed": passed,
+        "total": len(checks),
+        "ratio_series": aligned,
+        "latest_ratio": safe_float(latest["ETH_BTC"]),
+    }
+
+
+def calculate_score(
+    box_result: dict[str, Any],
+    trend_result: dict[str, Any],
+    dry_up_result: dict[str, Any],
+    rs_result: dict[str, Any],
+) -> dict[str, Any]:
+    box_points = 25 if box_result["valid"] else 0
+    trend_points = round(30 * trend_result["passed"] / trend_result["total"])
+    dry_up_points = 15 if dry_up_result["pass"] else 0
+    rs_points = round(15 * rs_result["passed"] / rs_result["total"])
+
+    breakout_points = 0
+    if box_result["confirmed_breakout"]:
+        breakout_points = 15
+    elif box_result["price_breakout"]:
+        breakout_points = 8
+    elif box_result["state"] == "BREAKOUT WATCH":
+        breakout_points = 4
+
+    total = box_points + trend_points + dry_up_points + rs_points + breakout_points
+
+    return {
+        "Box": box_points,
+        "Trend": trend_points,
+        "Dry-up": dry_up_points,
+        "Relative strength": rs_points,
+        "Breakout": breakout_points,
+        "Total": total,
+    }
+
+
+def make_price_chart(
+    df: pd.DataFrame,
+    box_result: dict[str, Any],
+    settings: Settings,
+    asset_name: str,
+) -> go.Figure:
+    visible = df.tail(settings.chart_days).copy()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=visible.index,
+            open=visible["Open"],
+            high=visible["High"],
+            low=visible["Low"],
+            close=visible["Close"],
+            name=asset_name,
+        )
+    )
+
+    for length in (50, 150, 200):
+        fig.add_trace(
+            go.Scatter(
+                x=visible.index,
+                y=visible[f"SMA_{length}"],
+                mode="lines",
+                name=f"{length}-day SMA",
+                line={"width": 1.2},
+            )
         )
 
-        try:
-            downloaded = download_batch(batch)
-        except Exception as exc:
-            for ticker in batch:
-                error_rows.append(
-                    {
-                        "Ticker": ticker,
-                        "Stage": "Download",
-                        "Error": str(exc),
-                    }
-                )
-            processed += len(batch)
-            progress.progress(
-                min(processed / len(tickers), 1.0),
-                text=f"Processed {processed} of {len(tickers)} stocks",
-            )
-            continue
-
-        for ticker in batch:
-            try:
-                frame = extract_ticker_frame(downloaded, ticker, len(batch))
-                metadata = lookup.loc[ticker]
-
-                breakout_rows.extend(
-                    analyze_recent_spikes(
-                        ticker=ticker,
-                        company=metadata["Company"],
-                        sector=metadata["Sector"],
-                        frame=frame,
-                        config=config,
-                    )
-                )
-
-                quiet_result = analyze_current_quiet_setup(
-                    ticker=ticker,
-                    company=metadata["Company"],
-                    sector=metadata["Sector"],
-                    frame=frame,
-                    config=config,
-                )
-                if quiet_result:
-                    quiet_rows.append(quiet_result)
-
-            except Exception as exc:
-                error_rows.append(
-                    {
-                        "Ticker": ticker,
-                        "Stage": "Analysis",
-                        "Error": str(exc),
-                    }
-                )
-
-            processed += 1
-            progress.progress(
-                min(processed / len(tickers), 1.0),
-                text=f"Processed {processed} of {len(tickers)} stocks",
-            )
-
-        if batch_number < len(batches) and config.pause_seconds > 0:
-            time.sleep(config.pause_seconds)
-
-    progress.empty()
-    status.empty()
-
-    breakouts = pd.DataFrame(breakout_rows)
-    quiet = pd.DataFrame(quiet_rows)
-    errors = pd.DataFrame(error_rows)
-
-    if not breakouts.empty:
-        # Keep the strongest qualifying spike per ticker.
-        breakouts = (
-            breakouts.sort_values(
-                ["Ticker", "Volume Multiple", "Spike Date"],
-                ascending=[True, False, False],
-            )
-            .drop_duplicates("Ticker", keep="first")
-            .sort_values(
-                ["Volume Multiple", "Candle Change %"],
-                ascending=[False, False],
-            )
-            .reset_index(drop=True)
+    if box_result.get("box_start") in visible.index or box_result.get("box_end") in visible.index:
+        box_start = max(box_result["box_start"], visible.index.min())
+        fig.add_shape(
+            type="rect",
+            x0=box_start,
+            x1=visible.index.max(),
+            y0=box_result["box_low"],
+            y1=box_result["box_high"],
+            line={"width": 1.5, "dash": "dash"},
+            fillcolor="rgba(120,120,120,0.10)",
+        )
+        fig.add_hline(
+            y=box_result["breakout_level"],
+            line_dash="dot",
+            annotation_text="Breakout level",
         )
 
-    if not quiet.empty:
-        quiet = quiet.sort_values(
-            ["Quiet/Baseline Ratio", "Distance to Quiet High %"],
-            ascending=[True, True],
-        ).reset_index(drop=True)
-
-    return breakouts, quiet, errors
-
-
-def csv_bytes(frame: pd.DataFrame) -> bytes:
-    return frame.to_csv(index=False).encode("utf-8")
-
-
-st.title("📈 S&P 500 Volume Breakout Scanner")
-st.caption(
-    "Find stocks emerging from consistently low volume, plus stocks that "
-    "remain compressed and may be worth monitoring."
-)
-
-with st.sidebar:
-    st.header("Scanner settings")
-
-    quiet_days = st.number_input(
-        "Quiet period (trading days)",
-        min_value=5,
-        max_value=60,
-        value=20,
-        step=1,
+    fig.update_layout(
+        title=f"{asset_name}: Price, Trend Averages and Current Darvas Box",
+        xaxis_title=None,
+        yaxis_title="USD",
+        xaxis_rangeslider_visible=False,
+        height=650,
+        legend={"orientation": "h"},
+        margin={"l": 20, "r": 20, "t": 70, "b": 20},
     )
+    return fig
 
-    baseline_days = st.number_input(
-        "Historical baseline (trading days)",
-        min_value=20,
-        max_value=180,
-        value=60,
-        step=5,
-    )
 
-    recent_days = st.number_input(
-        "Recent spike window (trading days)",
-        min_value=1,
-        max_value=20,
-        value=7,
-        step=1,
-    )
+def make_volume_chart(df: pd.DataFrame, settings: Settings) -> go.Figure:
+    visible = df.tail(settings.chart_days).copy()
 
-    spike_multiplier = st.slider(
-        "Huge-volume multiplier",
-        min_value=2.0,
-        max_value=10.0,
-        value=4.0,
-        step=0.25,
-    )
-
-    quiet_ratio = st.slider(
-        "Maximum quiet/baseline volume ratio",
-        min_value=0.20,
-        max_value=1.00,
-        value=0.65,
-        step=0.05,
-        help=(
-            "A value of 0.65 means quiet-period median volume must be "
-            "65% or less of the earlier baseline median."
-        ),
-    )
-
-    low_day_percent = st.slider(
-        "Minimum low-volume days",
-        min_value=50,
-        max_value=100,
-        value=80,
-        step=5,
-    )
-
-    max_quiet_cv = st.slider(
-        "Maximum quiet-volume variability",
-        min_value=0.10,
-        max_value=1.00,
-        value=0.40,
-        step=0.05,
-        help=(
-            "Lower values require more consistent volume during the "
-            "quiet period."
-        ),
-    )
-
-    min_median_volume = st.number_input(
-        "Minimum median daily volume",
-        min_value=0,
-        max_value=10_000_000,
-        value=100_000,
-        step=50_000,
-    )
-
-    require_price_breakout = st.checkbox(
-        "Require close above quiet-period high",
-        value=False,
-    )
-
-    require_bullish_candle = st.checkbox(
-        "Require bullish spike candle",
-        value=False,
-    )
-
-    with st.expander("Download settings"):
-        batch_size = st.number_input(
-            "Tickers per batch",
-            min_value=10,
-            max_value=150,
-            value=50,
-            step=10,
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=visible.index,
+            y=visible["Dollar_Volume"],
+            name="Daily USD volume",
         )
-        pause_seconds = st.number_input(
-            "Pause between batches (seconds)",
-            min_value=0.0,
-            max_value=5.0,
-            value=0.5,
-            step=0.5,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=visible.index,
+            y=visible["Dollar_Volume_Avg_20"],
+            mode="lines",
+            name="20-day average USD volume",
+        )
+    )
+    fig.update_layout(
+        title="Dollar Volume",
+        xaxis_title=None,
+        yaxis_title="USD",
+        height=380,
+        legend={"orientation": "h"},
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+    )
+    return fig
+
+
+def render_checks(title: str, checks: dict[str, bool]) -> None:
+    st.subheader(title)
+    for label, passed in checks.items():
+        st.write(f"{'✅' if passed else '❌'} {label}")
+
+
+def format_currency(value: float) -> str:
+    if not np.isfinite(value):
+        return "N/A"
+    if abs(value) >= 1_000:
+        return f"${value:,.2f}"
+    return f"${value:,.4f}"
+
+
+def main() -> None:
+    st.title("📦 Darvas + Minervini Crypto Scanner")
+    st.caption(
+        "A present-state BTC/ETH scanner. It identifies boxes, trend quality, "
+        "volume contraction and breakout conditions; it does not backtest or predict returns."
+    )
+
+    with st.sidebar:
+        st.header("Asset")
+        asset_name = st.selectbox("Cryptocurrency", list(CRYPTO_ASSETS))
+        ticker = CRYPTO_ASSETS[asset_name]
+
+        st.header("Darvas Box")
+        box_days = st.slider("Box lookback days", 10, 90, 30)
+        max_box_range_pct = st.slider("Maximum box range (%)", 3.0, 35.0, 15.0, 0.5)
+        test_tolerance_pct = st.slider("Boundary test tolerance (%)", 0.25, 5.0, 1.5, 0.25)
+        minimum_high_tests = st.slider("Minimum upper-bound tests", 1, 6, 2)
+        minimum_low_tests = st.slider("Minimum lower-bound tests", 1, 6, 2)
+
+        st.header("Breakout")
+        breakout_buffer_pct = st.slider("Breakout buffer (%)", 0.0, 5.0, 0.5, 0.1)
+        breakout_volume_multiple = st.slider(
+            "Minimum volume multiple", 1.0, 5.0, 1.5, 0.1
         )
 
-    run_button = st.button(
-        "Run S&P 500 scan",
-        type="primary",
-        use_container_width=True,
-    )
+        st.header("Volume Dry-Up")
+        dry_up_days = st.slider("Recent dry-up days", 3, 30, 10)
+        baseline_volume_days = st.slider("Baseline volume days", 10, 90, 30)
+        dry_up_ratio_max = st.slider(
+            "Maximum recent/baseline volume ratio", 0.25, 1.0, 0.70, 0.05
+        )
 
-st.info(
-    "**Volume breakout** means a huge daily volume candle after a qualifying "
-    "quiet period. It does not require a price breakout unless that sidebar "
-    "option is enabled."
-)
+        st.header("Trend")
+        near_high_pct = st.slider("Maximum distance from 365-day high (%)", 5, 50, 25)
+        atr_days = st.slider("ATR period", 5, 30, 14)
+        chart_days = st.slider("Chart history days", 90, 730, 365, 30)
 
-try:
-    constituents = load_sp500_constituents()
-    st.caption(f"Universe loaded: {len(constituents)} S&P 500 securities.")
-except Exception as exc:
-    st.error(f"Could not load the S&P 500 list: {exc}")
-    st.stop()
+        refresh = st.button("Refresh market data", use_container_width=True)
+        if refresh:
+            st.cache_data.clear()
 
-if run_button:
-    config = ScannerConfig(
-        quiet_days=int(quiet_days),
-        baseline_days=int(baseline_days),
-        recent_days=int(recent_days),
-        spike_multiplier=float(spike_multiplier),
-        quiet_ratio=float(quiet_ratio),
-        low_day_fraction=float(low_day_percent) / 100,
-        max_quiet_cv=float(max_quiet_cv),
-        min_median_volume=int(min_median_volume),
-        require_price_breakout=bool(require_price_breakout),
-        require_bullish_candle=bool(require_bullish_candle),
-        batch_size=int(batch_size),
-        pause_seconds=float(pause_seconds),
+    settings = Settings(
+        history_period="3y",
+        box_days=box_days,
+        max_box_range_pct=max_box_range_pct,
+        test_tolerance_pct=test_tolerance_pct,
+        minimum_high_tests=minimum_high_tests,
+        minimum_low_tests=minimum_low_tests,
+        breakout_buffer_pct=breakout_buffer_pct,
+        breakout_volume_multiple=breakout_volume_multiple,
+        dry_up_days=dry_up_days,
+        baseline_volume_days=baseline_volume_days,
+        dry_up_ratio_max=dry_up_ratio_max,
+        atr_days=atr_days,
+        near_high_pct=near_high_pct,
+        chart_days=chart_days,
     )
 
     try:
-        breakouts, quiet, errors = run_scan(constituents, config)
-        st.session_state["breakouts"] = breakouts
-        st.session_state["quiet"] = quiet
-        st.session_state["errors"] = errors
-        st.session_state["last_config"] = config
+        with st.spinner(f"Loading {asset_name} daily candles..."):
+            raw_asset = download_market_data(ticker, settings.history_period)
+            raw_btc = (
+                raw_asset.copy()
+                if ticker == "BTC-USD"
+                else download_market_data("BTC-USD", settings.history_period)
+            )
     except Exception as exc:
-        st.exception(exc)
+        st.error(f"Could not load market data: {exc}")
+        st.stop()
 
-if "breakouts" in st.session_state:
-    breakouts = st.session_state["breakouts"]
-    quiet = st.session_state["quiet"]
-    errors = st.session_state["errors"]
+    if raw_asset.empty or raw_btc.empty:
+        st.error("No market data was returned. Try Refresh market data.")
+        st.stop()
 
-    metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric("Recent spike stocks", len(breakouts))
-    metric_2.metric("Still-low-volume stocks", len(quiet))
-    metric_3.metric("Download/analysis errors", len(errors))
+    asset_df = add_indicators(raw_asset, settings)
+    btc_df = add_indicators(raw_btc, settings)
 
-    breakout_tab, quiet_tab, error_tab, rules_tab = st.tabs(
+    minimum_rows = max(221, settings.box_days + 2)
+    if len(asset_df) < minimum_rows:
+        st.error(f"At least {minimum_rows} daily candles are required.")
+        st.stop()
+
+    box_result = detect_current_box(asset_df, settings)
+    trend_result = evaluate_trend_template(asset_df, settings)
+    dry_up_result = evaluate_volume_dry_up(asset_df, settings)
+    rs_result = evaluate_relative_strength(ticker, asset_df, btc_df)
+    score = calculate_score(box_result, trend_result, dry_up_result, rs_result)
+
+    latest = asset_df.iloc[-1]
+    prior = asset_df.iloc[-2]
+    daily_change = (latest["Close"] / prior["Close"] - 1) * 100
+    latest_date = asset_df.index[-1].strftime("%Y-%m-%d")
+
+    st.info(
+        f"Latest available daily candle: **{latest_date}**. "
+        "Crypto daily candles from the data source may still be incomplete before the UTC day closes."
+    )
+
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("Price", format_currency(latest["Close"]), f"{daily_change:.2f}%")
+    metric_columns[1].metric("Strategy Score", f"{score['Total']}/100")
+    metric_columns[2].metric("State", box_result["state"])
+    metric_columns[3].metric("Box High", format_currency(box_result["box_high"]))
+    metric_columns[4].metric("Box Low", format_currency(box_result["box_low"]))
+    metric_columns[5].metric(
+        "Breakout Volume",
+        f"{box_result['volume_multiple']:.2f}×"
+        if np.isfinite(box_result["volume_multiple"])
+        else "N/A",
+    )
+
+    tabs = st.tabs(
         [
-            "Recent volume spikes",
-            "Still low volume",
-            "Errors",
-            "Rule definitions",
+            "Overview",
+            "Darvas Box",
+            "Trend Template",
+            "Volume Dry-Up",
+            "Relative Strength",
+            "Raw Data",
         ]
     )
 
-    with breakout_tab:
-        st.subheader("Recent huge-volume spike candles")
+    with tabs[0]:
+        st.plotly_chart(
+            make_price_chart(asset_df, box_result, settings, asset_name),
+            use_container_width=True,
+        )
+        st.plotly_chart(
+            make_volume_chart(asset_df, settings),
+            use_container_width=True,
+        )
 
-        if breakouts.empty:
-            st.warning("No stocks matched the current breakout settings.")
-        else:
-            sectors = sorted(breakouts["Sector"].dropna().unique())
-            chosen_sectors = st.multiselect(
-                "Filter breakout sectors",
-                sectors,
-                default=sectors,
-                key="breakout_sector_filter",
+        st.subheader("Score Breakdown")
+        score_table = pd.DataFrame(
+            [{"Component": key, "Points": value} for key, value in score.items() if key != "Total"]
+        )
+        st.dataframe(score_table, hide_index=True, use_container_width=True)
+
+        if box_result["confirmed_breakout"]:
+            st.success(
+                "The latest candle meets the configured box, price-breakout and volume-confirmation rules."
             )
-            visible_breakouts = breakouts[
-                breakouts["Sector"].isin(chosen_sectors)
+        elif box_result["state"] == "PRICE BREAKOUT / WEAK VOLUME":
+            st.warning(
+                "Price has cleared the breakout level, but volume has not reached the configured confirmation multiple."
+            )
+        elif box_result["state"] == "BREAKOUT WATCH":
+            st.warning("Price is within 2% of the current box high.")
+        elif box_result["valid"]:
+            st.info("A valid box is present, but price is not yet near a confirmed breakout.")
+        else:
+            st.error("The selected lookback does not currently form a valid Darvas box.")
+
+    with tabs[1]:
+        details = {
+            "Status": box_result["state"],
+            "Box start": box_result["box_start"].strftime("%Y-%m-%d"),
+            "Box end": box_result["box_end"].strftime("%Y-%m-%d"),
+            "Box high": format_currency(box_result["box_high"]),
+            "Box low": format_currency(box_result["box_low"]),
+            "Box range": f"{box_result['box_range_pct']:.2f}%",
+            "Upper-bound tests": box_result["high_tests"],
+            "Lower-bound tests": box_result["low_tests"],
+            "Closes contained": f"{box_result['inside_ratio'] * 100:.1f}%",
+            "Breakout level": format_currency(box_result["breakout_level"]),
+            "Price breakout": "Yes" if box_result["price_breakout"] else "No",
+            "Volume confirmation": "Yes" if box_result["volume_breakout"] else "No",
+        }
+        st.dataframe(
+            pd.DataFrame(details.items(), columns=["Measure", "Value"]),
+            hide_index=True,
+            use_container_width=True,
+        )
+        render_checks("Box Qualification", box_result["checks"])
+
+    with tabs[2]:
+        left, right = st.columns([1, 1])
+        with left:
+            render_checks(
+                f"Trend Rules: {trend_result['passed']}/{trend_result['total']} Passed",
+                trend_result["checks"],
+            )
+        with right:
+            trend_values = pd.DataFrame(
+                [
+                    {"Measure": "50-day SMA", "Value": format_currency(trend_result["sma_50"])},
+                    {"Measure": "150-day SMA", "Value": format_currency(trend_result["sma_150"])},
+                    {"Measure": "200-day SMA", "Value": format_currency(trend_result["sma_200"])},
+                    {
+                        "Measure": "Distance from 365-day high",
+                        "Value": f"{trend_result['distance_from_high_pct']:.2f}%",
+                    },
+                ]
+            )
+            st.dataframe(trend_values, hide_index=True, use_container_width=True)
+
+    with tabs[3]:
+        dryup_values = pd.DataFrame(
+            [
+                {
+                    "Measure": "Recent/baseline dollar-volume ratio",
+                    "Value": (
+                        f"{dry_up_result['ratio']:.2f}"
+                        if np.isfinite(dry_up_result["ratio"])
+                        else "N/A"
+                    ),
+                },
+                {
+                    "Measure": "Recent average dollar volume",
+                    "Value": format_currency(dry_up_result.get("recent_average", np.nan)),
+                },
+                {
+                    "Measure": "Baseline average dollar volume",
+                    "Value": format_currency(dry_up_result.get("baseline_average", np.nan)),
+                },
+                {
+                    "Measure": "Recent average ATR %",
+                    "Value": f"{dry_up_result.get('recent_atr_pct', np.nan):.2f}%",
+                },
+                {
+                    "Measure": "Prior average ATR %",
+                    "Value": f"{dry_up_result.get('prior_atr_pct', np.nan):.2f}%",
+                },
+                {
+                    "Measure": "Volume + ATR dry-up passes",
+                    "Value": "Yes" if dry_up_result["pass"] else "No",
+                },
             ]
+        )
+        st.dataframe(dryup_values, hide_index=True, use_container_width=True)
+        st.caption(
+            "Dollar volume is used instead of raw coin volume so BTC and ETH activity is easier to compare."
+        )
 
-            st.dataframe(
-                visible_breakouts,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Volume Multiple": st.column_config.NumberColumn(
-                        format="%.2fx"
-                    ),
-                    "Candle Change %": st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                    "Close vs Quiet High %": st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                },
+    with tabs[4]:
+        render_checks(
+            f"{rs_result['label']}: {rs_result['passed']}/{rs_result['total']} Passed",
+            rs_result["checks"],
+        )
+
+        if rs_result["ratio_series"] is not None:
+            ratio = rs_result["ratio_series"].tail(settings.chart_days)
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=ratio.index,
+                    y=ratio["ETH_BTC"],
+                    mode="lines",
+                    name="ETH/BTC",
+                )
             )
-
-            st.download_button(
-                "Download breakout results",
-                data=csv_bytes(visible_breakouts),
-                file_name="recent_volume_spikes.csv",
-                mime="text/csv",
+            fig.add_trace(
+                go.Scatter(
+                    x=ratio.index,
+                    y=ratio["SMA_50"],
+                    mode="lines",
+                    name="50-day average",
+                )
             )
-
-    with quiet_tab:
-        st.subheader("Stocks still in a low-volume setup")
-
-        if quiet.empty:
-            st.warning("No stocks matched the current quiet-volume settings.")
-        else:
-            sectors = sorted(quiet["Sector"].dropna().unique())
-            chosen_sectors = st.multiselect(
-                "Filter quiet-setup sectors",
-                sectors,
-                default=sectors,
-                key="quiet_sector_filter",
+            fig.add_trace(
+                go.Scatter(
+                    x=ratio.index,
+                    y=ratio["SMA_200"],
+                    mode="lines",
+                    name="200-day average",
+                )
             )
-            visible_quiet = quiet[quiet["Sector"].isin(chosen_sectors)]
-
-            st.dataframe(
-                visible_quiet,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Latest Volume Multiple": st.column_config.NumberColumn(
-                        format="%.2fx"
-                    ),
-                    "Distance to Quiet High %": st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                },
+            fig.update_layout(
+                title="Ethereum Relative Strength Versus Bitcoin",
+                height=450,
+                yaxis_title="ETH/BTC ratio",
+                legend={"orientation": "h"},
             )
+            st.plotly_chart(fig, use_container_width=True)
 
-            st.download_button(
-                "Download quiet-stock results",
-                data=csv_bytes(visible_quiet),
-                file_name="still_low_volume.csv",
-                mime="text/csv",
-            )
+    with tabs[5]:
+        display_columns = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+            "Dollar_Volume",
+            "SMA_50",
+            "SMA_150",
+            "SMA_200",
+            "ATR_Pct",
+            "Distance_From_365D_High_Pct",
+        ]
+        export = asset_df[display_columns].copy().sort_index(ascending=False)
+        st.dataframe(export, use_container_width=True)
+        st.download_button(
+            "Download analyzed CSV",
+            data=export.to_csv().encode("utf-8"),
+            file_name=f"{ticker.replace('-', '_')}_darvas_minervini.csv",
+            mime="text/csv",
+        )
 
-    with error_tab:
-        if errors.empty:
-            st.success("No download or analysis errors were recorded.")
-        else:
-            st.dataframe(errors, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download error report",
-                data=csv_bytes(errors),
-                file_name="scan_errors.csv",
-                mime="text/csv",
-            )
-
-    with rules_tab:
+    with st.expander("How the crypto adaptation works"):
         st.markdown(
             """
-            ### Recent volume spike
-
-            For each of the latest configured sessions, the scanner:
-
-            1. Looks backward over the immediately preceding quiet period.
-            2. Compares that period with an older historical baseline.
-            3. Confirms that volume was low and reasonably consistent.
-            4. Tests whether the candidate candle's volume exceeds the quiet
-               median by the configured spike multiple.
-            5. Optionally requires a bullish candle or a close above the
-               quiet-period high.
-
-            Each candidate date uses only data available before that candle.
-
-            ### Still low volume
-
-            A stock appears here when its latest quiet-period window passes
-            the low-volume tests and no candle inside that window has already
-            reached the configured huge-volume threshold.
+            - **Darvas component:** The app tests whether the completed candles before the latest
+              candle stayed inside a configurable range and repeatedly tested both boundaries.
+            - **Breakout:** The latest close must exceed the prior box high plus a buffer.
+              Volume confirmation compares the latest coin volume with the previous 20 completed days.
+            - **Minervini-style trend template:** Uses 50-, 150- and 200-day averages, a rising
+              200-day average, the 365-day range midpoint and distance from the 365-day high.
+            - **Volume dry-up:** Compares recent average USD trading volume with an earlier baseline
+              and also requires average ATR percentage to contract.
+            - **Relative strength:** Ethereum is evaluated against Bitcoin through ETH/BTC.
+              Bitcoin uses positive 30-, 90- and 180-day momentum because it is the benchmark asset.
             """
         )
 
-else:
-    st.write("Choose the scanner settings and select **Run S&P 500 scan**.")
+    st.caption(
+        "Educational scanner only—not investment advice. Signals can fail, volume data varies by source, "
+        "and the current UTC daily candle may be incomplete."
+    )
 
-st.divider()
-st.caption(
-    "Market data is obtained through yfinance for research and educational "
-    "use. Screening results are not investment advice."
-)
+
+if __name__ == "__main__":
+    main()
