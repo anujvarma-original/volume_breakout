@@ -557,7 +557,12 @@ def calculate_score(
     dry_up_result: dict[str, Any],
     rs_result: dict[str, Any],
 ) -> dict[str, Any]:
-    box_points = 25 if box_result["valid"] else 0
+    box_quality = safe_float(box_result.get("quality_score", 0.0), 0.0)
+    box_points = (
+        round(25 * max(0.0, min(100.0, box_quality)) / 100.0)
+        if box_result["valid"]
+        else 0
+    )
     trend_points = round(30 * trend_result["passed"] / trend_result["total"])
     dry_up_points = 15 if dry_up_result["pass"] else 0
     rs_points = round(15 * rs_result["passed"] / rs_result["total"])
