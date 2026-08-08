@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# BUILD: MULTI-TICKER + BREAKOUT FORECAST V2
+
 from dataclasses import dataclass
 from typing import Any
 import json
@@ -14,7 +16,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-
 
 
 st.set_page_config(
@@ -579,6 +580,241 @@ def calculate_score(
     }
 
 
+
+def _future_confirmed_breakout(
+    df: pd.DataFrame,
+    watch_pos: int,
+    breakout_level: float,
+    settings: Settings,
+    horizon: int,
+) -> bool:
+    """Check whether a frozen watch-level confirms within the next N sessions."""
+    end = min(len(df) - 1, watch_pos + horizon)
+    for pos in range(watch_pos + 1, end + 1):
+        close = safe_float(df["Close"].iloc[pos])
+        volume = safe_float(df["Volume"].iloc[pos], 0.0)
+        prior_start = max(0, pos - 20)
+        prior_avg = safe_float(df["Volume"].iloc[prior_start:pos].mean(), 0.0)
+        volume_multiple = volume / prior_avg if prior_avg > 0 else np.nan
+        if close > breakout_level and np.isfinite(volume_multiple) and volume_multiple >= settings.breakout_volume_multiple:
+            return True
+    return False
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def estimate_breakout_probability(
+    df: pd.DataFrame,
+    settings: Settings,
+    current_box: dict[str, Any],
+    current_trend: dict[str, Any],
+    current_dry_up: dict[str, Any],
+    horizons: tuple[int, ...] = (3, 5, 10),
+    max_samples: int = 120,
+) -> dict[str, Any]:
+    """Estimate watch->confirmed-breakout odds from this ticker's own history.
+
+    This is a walk-forward analog estimator. For each historical date we only use
+    candles available as of that date, identify BREAKOUT WATCH states, freeze that
+    watch's breakout level, then observe whether a volume-confirmed breakout occurs
+    within the requested future horizons. Similar historical setups receive larger
+    weights than dissimilar ones.
+    """
+    if not current_box.get("valid") or current_box.get("state") != "BREAKOUT WATCH":
+        return {"available": False, "reason": "Current state is not BREAKOUT WATCH", "probabilities": {}}
+
+    warmup = max(221, settings.max_base_days + 2, settings.baseline_volume_days + settings.dry_up_days + 5)
+    if len(df) < warmup + max(horizons) + 10:
+        return {"available": False, "reason": "Not enough history for probability calibration", "probabilities": {}}
+
+    latest_close = safe_float(current_box.get("latest_close"))
+    breakout_level = safe_float(current_box.get("breakout_level"))
+    current_distance = max(0.0, (breakout_level - latest_close) / breakout_level * 100) if breakout_level else np.nan
+    current_features = {
+        "distance": current_distance,
+        "quality": safe_float(current_box.get("quality_score"), 0.0),
+        "volume": safe_float(current_box.get("volume_multiple"), 0.0),
+        "trend": safe_float(current_trend.get("pass_pct"), 0.0),
+        "dryup": safe_float(current_dry_up.get("ratio"), 1.0),
+        "range": safe_float(current_box.get("box_range_pct"), settings.max_box_range_pct),
+    }
+
+    samples: list[dict[str, Any]] = []
+    last_watch_pos = -999
+    # Sample every second session and cap the calibration window to keep Streamlit responsive.
+    step = 2
+    final_train_pos = len(df) - max(horizons) - 1
+    first_train_pos = max(warmup - 1, final_train_pos - 520)
+
+    for pos in range(first_train_pos, final_train_pos, step):
+        # Avoid counting the same multi-day watch episode every day.
+        if pos - last_watch_pos <= 2:
+            continue
+        hist = df.iloc[: pos + 1].copy()
+        box = detect_current_box(hist, settings)
+        if not box.get("valid") or box.get("state") != "BREAKOUT WATCH":
+            continue
+
+        trend = evaluate_trend_template(hist, settings)
+        dry = evaluate_volume_dry_up(hist, settings)
+        close = safe_float(box.get("latest_close"))
+        level = safe_float(box.get("breakout_level"))
+        if not np.isfinite(close) or not np.isfinite(level) or level <= 0:
+            continue
+
+        distance = max(0.0, (level - close) / level * 100)
+        feat = {
+            "distance": distance,
+            "quality": safe_float(box.get("quality_score"), 0.0),
+            "volume": safe_float(box.get("volume_multiple"), 0.0),
+            "trend": safe_float(trend.get("pass_pct"), 0.0),
+            "dryup": safe_float(dry.get("ratio"), 1.0),
+            "range": safe_float(box.get("box_range_pct"), settings.max_box_range_pct),
+        }
+
+        # Normalized Euclidean distance. Scales are intentionally interpretable.
+        d2 = (
+            ((feat["distance"] - current_features["distance"]) / 1.5) ** 2
+            + ((feat["quality"] - current_features["quality"]) / 20.0) ** 2
+            + ((feat["volume"] - current_features["volume"]) / 0.75) ** 2
+            + ((feat["trend"] - current_features["trend"]) / 25.0) ** 2
+            + ((feat["dryup"] - current_features["dryup"]) / 0.35) ** 2
+            + ((feat["range"] - current_features["range"]) / 7.5) ** 2
+        )
+        weight = 1.0 / (1.0 + d2)
+        outcomes = {
+            h: _future_confirmed_breakout(df, pos, level, settings, h)
+            for h in horizons
+        }
+        samples.append({"pos": pos, "weight": weight, "outcomes": outcomes, **feat})
+        last_watch_pos = pos
+
+    if not samples:
+        return {"available": False, "reason": "No historical BREAKOUT WATCH samples found", "probabilities": {}}
+
+    samples = sorted(samples, key=lambda x: x["weight"], reverse=True)[:max_samples]
+    total_weight = sum(s["weight"] for s in samples)
+    probabilities = {}
+    raw_rates = {}
+    for h in horizons:
+        probabilities[h] = 100.0 * sum(s["weight"] * int(s["outcomes"][h]) for s in samples) / total_weight
+        raw_rates[h] = 100.0 * sum(int(s["outcomes"][h]) for s in samples) / len(samples)
+
+    # Effective sample size is more informative than raw count when weighting.
+    w = np.array([s["weight"] for s in samples], dtype=float)
+    effective_n = float((w.sum() ** 2) / np.square(w).sum()) if np.square(w).sum() > 0 else 0.0
+    p5 = probabilities.get(5, next(iter(probabilities.values())))
+    confidence = "HIGH" if effective_n >= 25 else "MEDIUM" if effective_n >= 12 else "LOW"
+    band = "HIGH" if p5 >= 70 else "MODERATE" if p5 >= 50 else "LOW"
+
+    return {
+        "available": True,
+        "probabilities": probabilities,
+        "raw_rates": raw_rates,
+        "samples": len(samples),
+        "effective_samples": effective_n,
+        "confidence": confidence,
+        "probability_band": band,
+        "current_distance_pct": current_distance,
+    }
+
+
+def find_prior_resistance_levels(
+    df: pd.DataFrame,
+    box_result: dict[str, Any],
+    max_levels: int = 3,
+    swing_order: int = 5,
+    cluster_pct: float = 2.0,
+) -> list[float]:
+    """Find clustered historical swing highs above the current price."""
+    if not box_result.get("valid"):
+        return []
+
+    current_price = safe_float(box_result.get("latest_close"))
+    if not np.isfinite(current_price):
+        return []
+
+    history = df.copy()
+    box_start = box_result.get("box_start")
+    if box_start is not None:
+        history = history.loc[history.index < box_start]
+    highs = history["High"].astype(float)
+    if len(highs) < swing_order * 2 + 1:
+        return []
+
+    candidates: list[float] = []
+    vals = highs.to_numpy()
+    for i in range(swing_order, len(vals) - swing_order):
+        center = vals[i]
+        if not np.isfinite(center) or center <= current_price:
+            continue
+        if center >= np.nanmax(vals[i - swing_order:i + swing_order + 1]):
+            candidates.append(float(center))
+
+    if not candidates:
+        return []
+
+    # Cluster nearby resistance prices so repeated tests of the same zone count once.
+    candidates.sort()
+    clusters: list[list[float]] = []
+    for price in candidates:
+        if not clusters:
+            clusters.append([price])
+            continue
+        center = float(np.mean(clusters[-1]))
+        if abs(price - center) / center * 100 <= cluster_pct:
+            clusters[-1].append(price)
+        else:
+            clusters.append([price])
+
+    levels = [float(np.mean(c)) for c in clusters]
+    levels = [x for x in levels if x > current_price]
+    return levels[:max_levels]
+
+
+def calculate_breakout_targets(
+    df: pd.DataFrame,
+    box_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Build structural upside targets for a confirmed or price-only breakout."""
+    if not box_result.get("valid"):
+        return {"available": False, "targets": []}
+
+    latest_close = safe_float(box_result.get("latest_close"))
+    breakout_level = safe_float(box_result.get("breakout_level"))
+    box_high = safe_float(box_result.get("box_high"))
+    box_low = safe_float(box_result.get("box_low"))
+    latest_atr = safe_float(df["ATR"].iloc[-1])
+    if not all(np.isfinite(x) for x in [latest_close, breakout_level, box_high, box_low]):
+        return {"available": False, "targets": []}
+
+    targets: list[dict[str, Any]] = []
+    for idx, level in enumerate(find_prior_resistance_levels(df, box_result), start=1):
+        targets.append({"name": f"Resistance R{idx}", "price": level, "type": "Prior swing resistance"})
+
+    box_height = max(0.0, box_high - box_low)
+    if box_height > 0:
+        targets.append({"name": "Darvas target", "price": breakout_level + box_height, "type": "Box-height measured move"})
+
+    if np.isfinite(latest_atr) and latest_atr > 0:
+        for mult in (1, 2, 3):
+            targets.append({"name": f"{mult} ATR target", "price": breakout_level + mult * latest_atr, "type": "Volatility extension"})
+
+    for target in targets:
+        target["upside_from_price_pct"] = (target["price"] / latest_close - 1) * 100
+        target["upside_from_breakout_pct"] = (target["price"] / breakout_level - 1) * 100
+
+    targets = sorted(
+        [t for t in targets if np.isfinite(t["price"]) and t["price"] > latest_close],
+        key=lambda t: t["price"],
+    )
+    return {
+        "available": bool(targets),
+        "targets": targets,
+        "nearest_resistance": next((t for t in targets if t["type"] == "Prior swing resistance"), None),
+        "darvas_target": next((t for t in targets if t["name"] == "Darvas target"), None),
+        "atr": latest_atr,
+    }
+
 def make_price_chart(
     df: pd.DataFrame,
     box_result: dict[str, Any],
@@ -685,6 +921,7 @@ def format_currency(value: float) -> str:
 
 def main() -> None:
     st.title("📦 Darvas + Minervini Volume Breakout Scanner")
+    st.caption("Build: Multi-Ticker + Breakout Forecast V2")
     st.caption(
         "Scan crypto, stocks and ETFs with the same Darvas-box, Minervini trend, "
         "volume-contraction and breakout logic."
@@ -803,6 +1040,17 @@ def main() -> None:
     rs_result = evaluate_relative_strength(ticker, asset_df, btc_df)
     score = calculate_score(box_result, trend_result, dry_up_result, rs_result)
 
+    breakout_probability = (
+        estimate_breakout_probability(asset_df, settings, box_result, trend_result, dry_up_result)
+        if box_result.get("state") == "BREAKOUT WATCH"
+        else {"available": False, "probabilities": {}}
+    )
+    breakout_targets = (
+        calculate_breakout_targets(asset_df, box_result)
+        if box_result.get("confirmed_breakout") or box_result.get("price_breakout")
+        else {"available": False, "targets": []}
+    )
+
     latest = asset_df.iloc[-1]
     prior = asset_df.iloc[-2]
     daily_change = (latest["Close"] / prior["Close"] - 1) * 100
@@ -828,18 +1076,33 @@ def main() -> None:
         "Crypto daily candles from the data source may still be incomplete before the UTC day closes."
     )
 
-    metric_columns = st.columns(6)
+    metric_columns = st.columns(7)
     metric_columns[0].metric("Price", format_currency(latest["Close"]), f"{daily_change:.2f}%")
     metric_columns[1].metric("Strategy Score", f"{score['Total']}/100")
-    metric_columns[2].metric("State", box_result["state"])
-    metric_columns[3].metric("Box High", format_currency(box_result["box_high"]))
-    metric_columns[4].metric("Box Low", format_currency(box_result["box_low"]))
+    metric_columns[2].metric("State", box_result.get("state", "N/A"))
+    metric_columns[3].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
+    metric_columns[4].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
     metric_columns[5].metric(
         "Breakout Volume",
-        f"{box_result['volume_multiple']:.2f}×"
-        if np.isfinite(box_result["volume_multiple"])
+        f"{safe_float(box_result.get('volume_multiple')):.2f}×"
+        if np.isfinite(safe_float(box_result.get("volume_multiple")))
         else "N/A",
     )
+    if breakout_probability.get("available"):
+        metric_columns[6].metric(
+            "5-Day Breakout Prob.",
+            f"{breakout_probability['probabilities'].get(5, np.nan):.0f}%",
+            breakout_probability.get("confidence", ""),
+        )
+    elif breakout_targets.get("available"):
+        first_target = breakout_targets["targets"][0]
+        metric_columns[6].metric(
+            "Nearest Target",
+            format_currency(first_target["price"]),
+            f"{first_target['upside_from_price_pct']:+.1f}%",
+        )
+    else:
+        metric_columns[6].metric("Forecast", "N/A")
 
     tabs = st.tabs(
         [
@@ -848,6 +1111,7 @@ def main() -> None:
             "Trend Template",
             "Volume Dry-Up",
             "Relative Strength",
+            "Breakout Forecast",
             "Raw Data",
         ]
     )
@@ -1008,6 +1272,88 @@ def main() -> None:
             st.plotly_chart(fig, use_container_width=True)
 
     with tabs[5]:
+        st.subheader("Breakout Forecast")
+        if box_result.get("state") == "BREAKOUT WATCH":
+            if breakout_probability.get("available"):
+                probs = breakout_probability["probabilities"]
+                cols = st.columns(3)
+                cols[0].metric("Within 3 sessions", f"{probs.get(3, np.nan):.1f}%")
+                cols[1].metric("Within 5 sessions", f"{probs.get(5, np.nan):.1f}%")
+                cols[2].metric("Within 10 sessions", f"{probs.get(10, np.nan):.1f}%")
+                st.write(
+                    f"**Probability band:** {breakout_probability['probability_band']}  |  "
+                    f"**Calibration confidence:** {breakout_probability['confidence']}  |  "
+                    f"**Historical watch samples:** {breakout_probability['samples']}  |  "
+                    f"**Effective weighted samples:** {breakout_probability['effective_samples']:.1f}"
+                )
+                st.caption(
+                    "These are ticker-specific walk-forward historical analog probabilities. "
+                    "A success requires a future close above the frozen breakout level plus the configured volume multiple. "
+                    "They are estimates, not guaranteed probabilities."
+                )
+            else:
+                st.info(breakout_probability.get("reason", "Historical probability is not available."))
+
+            resistance_preview = find_prior_resistance_levels(asset_df, box_result)
+            if resistance_preview:
+                preview = pd.DataFrame([
+                    {
+                        "Resistance": f"R{i}",
+                        "Price": level,
+                        "Room from current price (%)": (level / safe_float(box_result["latest_close"]) - 1) * 100,
+                    }
+                    for i, level in enumerate(resistance_preview, start=1)
+                ])
+                st.subheader("Overhead Resistance if Breakout Occurs")
+                st.dataframe(
+                    preview.style.format({"Price": "${:,.2f}", "Room from current price (%)": "{:.2f}%"}),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            else:
+                st.caption("No clear prior swing resistance above the current price was found in the available history.")
+
+        elif box_result.get("confirmed_breakout") or box_result.get("price_breakout"):
+            if breakout_targets.get("available"):
+                rows = [{
+                    "Target": t["name"],
+                    "Price": t["price"],
+                    "Upside from Current (%)": t["upside_from_price_pct"],
+                    "Upside from Breakout (%)": t["upside_from_breakout_pct"],
+                    "Basis": t["type"],
+                } for t in breakout_targets["targets"]]
+                target_df = pd.DataFrame(rows)
+                st.dataframe(
+                    target_df.style.format({
+                        "Price": "${:,.2f}",
+                        "Upside from Current (%)": "{:+.2f}%",
+                        "Upside from Breakout (%)": "{:+.2f}%",
+                    }),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                nearest = breakout_targets.get("nearest_resistance")
+                darvas = breakout_targets.get("darvas_target")
+                if nearest:
+                    st.info(
+                        f"Nearest historical resistance is {format_currency(nearest['price'])} "
+                        f"({nearest['upside_from_price_pct']:+.1f}% from the latest close)."
+                    )
+                if darvas:
+                    st.info(
+                        f"Darvas measured-move target is {format_currency(darvas['price'])} "
+                        f"({darvas['upside_from_price_pct']:+.1f}% from the latest close)."
+                    )
+                st.caption(
+                    "Targets are structural reference levels, not a prediction that price will reach them. "
+                    "Prior resistance is based on clustered historical swing highs; ATR targets adapt to current volatility."
+                )
+            else:
+                st.info("No upside target above the current price was found from the available history and volatility inputs.")
+        else:
+            st.info("Forecast outputs appear when the state is BREAKOUT WATCH or a price/confirmed breakout is detected.")
+
+    with tabs[6]:
         display_columns = [
             "Open",
             "High",
@@ -1044,6 +1390,11 @@ def main() -> None:
               and also requires average ATR percentage to contract.
             - **Relative strength:** Every non-BTC ticker is evaluated against Bitcoin using its
               ticker/BTC ratio. Bitcoin uses positive 30-, 90- and 180-day momentum as the benchmark.
+            - **Breakout Watch probability:** Replays historical watch states for the selected ticker and
+              estimates 3-, 5- and 10-session confirmation rates, weighting setups that most closely match
+              the current box quality, breakout distance, volume, trend, dry-up and box range.
+            - **Confirmed-breakout targets:** Shows clustered prior swing resistance, a Darvas box-height
+              measured move, and 1/2/3-ATR volatility extensions. These are reference levels, not guarantees.
             """
         )
 
