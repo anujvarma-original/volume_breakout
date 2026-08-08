@@ -17,7 +17,7 @@ import yfinance as yf
 
 
 st.set_page_config(
-    page_title="Darvas + Minervini Crypto Scanner",
+    page_title="Darvas + Minervini Volume Breakout Scanner",
     page_icon="📦",
     layout="wide",
 )
@@ -25,10 +25,20 @@ st.set_page_config(
 
 ALERT_STATE_FILE = Path(".breakout_alert_state.json")
 
-CRYPTO_ASSETS = {
-    "Bitcoin": "BTC-USD",
-    "Ethereum": "ETH-USD",
-}
+DEFAULT_TICKERS = "BTC-USD, ETH-USD, SPY, QQQ, NVDA, AAPL"
+
+def parse_tickers(raw: str) -> list[str]:
+    """Accept comma-, whitespace-, or newline-separated Yahoo Finance symbols."""
+    normalized = raw.replace("\n", ",").replace("\t", ",").replace(" ", ",")
+    tickers: list[str] = []
+    for item in normalized.split(","):
+        ticker = item.strip().upper()
+        if ticker and ticker not in tickers:
+            tickers.append(ticker)
+    return tickers
+
+def display_name_for_ticker(ticker: str) -> str:
+    return {"BTC-USD": "Bitcoin", "ETH-USD": "Ethereum"}.get(ticker, ticker)
 
 
 @dataclass(frozen=True)
@@ -511,48 +521,31 @@ def evaluate_relative_strength(
             "180-day return positive": safe_float(asset_df["Return_180D_Pct"].iloc[-1]) > 0,
         }
         passed = sum(returns.values())
-        return {
-            "label": "BTC momentum",
-            "checks": returns,
-            "passed": passed,
-            "total": len(returns),
-            "ratio_series": None,
-            "latest_ratio": np.nan,
-        }
+        return {"label": "BTC momentum", "checks": returns, "passed": passed,
+                "total": len(returns), "ratio_series": None,
+                "latest_ratio": np.nan, "ratio_column": None}
 
     aligned = pd.concat(
-        [
-            asset_df["Close"].rename("Asset"),
-            btc_df["Close"].rename("BTC"),
-        ],
-        axis=1,
-        join="inner",
+        [asset_df["Close"].rename("Asset"), btc_df["Close"].rename("BTC")],
+        axis=1, join="inner"
     ).dropna()
-
-    aligned["ETH_BTC"] = aligned["Asset"] / aligned["BTC"]
-    aligned["SMA_50"] = aligned["ETH_BTC"].rolling(50).mean()
-    aligned["SMA_200"] = aligned["ETH_BTC"].rolling(200).mean()
-    aligned["Return_30D"] = aligned["ETH_BTC"].pct_change(30) * 100
-    aligned["Return_90D"] = aligned["ETH_BTC"].pct_change(90) * 100
-
+    ratio_col = "ASSET_BTC"
+    aligned[ratio_col] = aligned["Asset"] / aligned["BTC"]
+    aligned["SMA_50"] = aligned[ratio_col].rolling(50).mean()
+    aligned["SMA_200"] = aligned[ratio_col].rolling(200).mean()
+    aligned["Return_30D"] = aligned[ratio_col].pct_change(30) * 100
+    aligned["Return_90D"] = aligned[ratio_col].pct_change(90) * 100
     latest = aligned.iloc[-1]
     checks = {
-        "ETH/BTC above 50-day average": latest["ETH_BTC"] > latest["SMA_50"],
-        "ETH/BTC above 200-day average": latest["ETH_BTC"] > latest["SMA_200"],
-        "ETH/BTC 30-day return positive": latest["Return_30D"] > 0,
-        "ETH/BTC 90-day return positive": latest["Return_90D"] > 0,
+        f"{asset_ticker}/BTC above 50-day average": latest[ratio_col] > latest["SMA_50"],
+        f"{asset_ticker}/BTC above 200-day average": latest[ratio_col] > latest["SMA_200"],
+        f"{asset_ticker}/BTC 30-day return positive": latest["Return_30D"] > 0,
+        f"{asset_ticker}/BTC 90-day return positive": latest["Return_90D"] > 0,
     }
-
-    passed = sum(bool(value) for value in checks.values())
-    return {
-        "label": "ETH relative strength vs BTC",
-        "checks": checks,
-        "passed": passed,
-        "total": len(checks),
-        "ratio_series": aligned,
-        "latest_ratio": safe_float(latest["ETH_BTC"]),
-    }
-
+    passed = sum(bool(v) for v in checks.values())
+    return {"label": f"{asset_ticker} relative strength vs BTC", "checks": checks,
+            "passed": passed, "total": len(checks), "ratio_series": aligned,
+            "latest_ratio": safe_float(latest[ratio_col]), "ratio_column": ratio_col}
 
 def calculate_score(
     box_result: dict[str, Any],
@@ -690,16 +683,27 @@ def format_currency(value: float) -> str:
 
 
 def main() -> None:
-    st.title("📦 Darvas + Minervini Crypto Scanner")
+    st.title("📦 Darvas + Minervini Volume Breakout Scanner")
     st.caption(
-        "A present-state BTC/ETH scanner. It identifies boxes, trend quality, "
-        "volume contraction and breakout conditions; it does not backtest or predict returns."
+        "Scan crypto, stocks and ETFs with the same Darvas-box, Minervini trend, "
+        "volume-contraction and breakout logic."
     )
 
     with st.sidebar:
-        st.header("Asset")
-        asset_name = st.selectbox("Cryptocurrency", list(CRYPTO_ASSETS))
-        ticker = CRYPTO_ASSETS[asset_name]
+        st.header("Tickers")
+        ticker_input = st.text_area(
+            "Symbols to analyze",
+            value=DEFAULT_TICKERS,
+            height=120,
+            help="Comma-, space-, or newline-separated Yahoo Finance symbols.",
+        )
+        ticker_list = parse_tickers(ticker_input)
+        if not ticker_list:
+            st.error("Enter at least one ticker.")
+            st.stop()
+        ticker = st.selectbox("Ticker to display", ticker_list)
+        asset_name = display_name_for_ticker(ticker)
+        st.caption(f"{len(ticker_list)} ticker(s) entered.")
 
         st.header("Darvas Box")
         min_base_days = st.slider("Minimum base length", 10, 40, 15)
@@ -769,7 +773,7 @@ def main() -> None:
     )
 
     try:
-        with st.spinner(f"Loading {asset_name} daily candles..."):
+        with st.spinner(f"Loading {asset_name} ({ticker}) daily candles..."):
             raw_asset = download_market_data(ticker, settings.history_period)
             raw_btc = (
                 raw_asset.copy()
@@ -958,7 +962,7 @@ def main() -> None:
         )
         st.dataframe(dryup_values, hide_index=True, use_container_width=True)
         st.caption(
-            "Dollar volume is used instead of raw coin volume so BTC and ETH activity is easier to compare."
+            "Dollar volume is used instead of raw share/coin volume so activity is more comparable across symbols."
         )
 
     with tabs[4]:
@@ -973,9 +977,9 @@ def main() -> None:
             fig.add_trace(
                 go.Scatter(
                     x=ratio.index,
-                    y=ratio["ETH_BTC"],
+                    y=ratio[rs_result["ratio_column"]],
                     mode="lines",
-                    name="ETH/BTC",
+                    name=f"{ticker}/BTC",
                 )
             )
             fig.add_trace(
@@ -995,9 +999,9 @@ def main() -> None:
                 )
             )
             fig.update_layout(
-                title="Ethereum Relative Strength Versus Bitcoin",
+                title=f"{ticker} Relative Strength Versus Bitcoin",
                 height=450,
-                yaxis_title="ETH/BTC ratio",
+                yaxis_title=f"{ticker}/BTC ratio",
                 legend={"orientation": "h"},
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -1037,8 +1041,8 @@ def main() -> None:
               200-day average, the 365-day range midpoint and distance from the 365-day high.
             - **Volume dry-up:** Compares recent average USD trading volume with an earlier baseline
               and also requires average ATR percentage to contract.
-            - **Relative strength:** Ethereum is evaluated against Bitcoin through ETH/BTC.
-              Bitcoin uses positive 30-, 90- and 180-day momentum because it is the benchmark asset.
+            - **Relative strength:** Every non-BTC ticker is evaluated against Bitcoin using its
+              ticker/BTC ratio. Bitcoin uses positive 30-, 90- and 180-day momentum as the benchmark.
             """
         )
 
