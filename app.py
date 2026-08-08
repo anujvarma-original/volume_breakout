@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# BUILD: MULTI-TICKER + BREAKOUT FORECAST V2
+# BUILD: DAILY S&P 500 + CRYPTO BREAKOUT SCANNER V3
 
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +10,7 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 from pathlib import Path
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,7 @@ st.set_page_config(
 
 
 ALERT_STATE_FILE = Path(".breakout_alert_state.json")
+DAILY_SCAN_STATE_FILE = Path(".daily_breakout_scan_state.json")
 
 DEFAULT_TICKERS = "BTC-USD, ETH-USD, SPY, QQQ, NVDA, AAPL"
 
@@ -919,9 +921,380 @@ def format_currency(value: float) -> str:
     return f"${value:,.4f}"
 
 
+
+def load_daily_scan_state() -> dict[str, Any]:
+    try:
+        if DAILY_SCAN_STATE_FILE.exists():
+            data = json.loads(DAILY_SCAN_STATE_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_daily_scan_state(state: dict[str, Any]) -> None:
+    try:
+        DAILY_SCAN_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sp500_tickers() -> list[str]:
+    """Return current S&P 500 Yahoo Finance symbols with two public-source fallbacks."""
+    urls = [
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+    ]
+    for url in urls:
+        try:
+            table = pd.read_csv(url)
+            symbol_col = next((c for c in table.columns if str(c).lower() in {"symbol", "ticker"}), None)
+            if symbol_col:
+                symbols = [str(s).strip().upper().replace(".", "-") for s in table[symbol_col].dropna()]
+                symbols = list(dict.fromkeys(s for s in symbols if s))
+                if len(symbols) >= 450:
+                    return symbols
+        except Exception:
+            pass
+
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        for table in tables:
+            symbol_col = next((c for c in table.columns if str(c).lower() in {"symbol", "ticker symbol"}), None)
+            if symbol_col:
+                symbols = [str(s).strip().upper().replace(".", "-") for s in table[symbol_col].dropna()]
+                symbols = list(dict.fromkeys(s for s in symbols if s))
+                if len(symbols) >= 450:
+                    return symbols
+    except Exception:
+        pass
+    raise RuntimeError("Could not load the S&P 500 constituent list from either source.")
+
+
+def normalize_download_frame(data: pd.DataFrame) -> pd.DataFrame:
+    if data is None or data.empty:
+        return pd.DataFrame()
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    missing = [c for c in required if c not in data.columns]
+    if missing:
+        return pd.DataFrame()
+    out = data[required].copy()
+    out.index = pd.to_datetime(out.index).tz_localize(None)
+    out = out.apply(pd.to_numeric, errors="coerce").dropna(subset=["Open", "High", "Low", "Close"])
+    out["Volume"] = out["Volume"].fillna(0)
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_market_data_batch(tickers: tuple[str, ...], period: str, chunk_size: int = 50) -> dict[str, pd.DataFrame]:
+    """Download many symbols in chunks so a 500-stock daily scan is practical."""
+    results: dict[str, pd.DataFrame] = {}
+    symbols = list(tickers)
+    for start in range(0, len(symbols), chunk_size):
+        chunk = symbols[start:start + chunk_size]
+        try:
+            raw = yf.download(
+                chunk,
+                period=period,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+            )
+        except Exception:
+            raw = pd.DataFrame()
+
+        if raw.empty:
+            continue
+
+        if len(chunk) == 1:
+            cleaned = normalize_download_frame(raw)
+            if not cleaned.empty:
+                results[chunk[0]] = cleaned
+            continue
+
+        for ticker in chunk:
+            try:
+                part = pd.DataFrame()
+                if isinstance(raw.columns, pd.MultiIndex):
+                    level0 = raw.columns.get_level_values(0)
+                    level1 = raw.columns.get_level_values(1)
+                    if ticker in level0:
+                        part = raw[ticker].copy()
+                    elif ticker in level1:
+                        part = raw.xs(ticker, axis=1, level=1).copy()
+                cleaned = normalize_download_frame(part)
+                if not cleaned.empty:
+                    results[ticker] = cleaned
+            except Exception:
+                continue
+    return results
+
+
+def evaluate_relative_strength_vs_benchmark(
+    asset_ticker: str,
+    asset_df: pd.DataFrame,
+    benchmark_ticker: str,
+    benchmark_df: pd.DataFrame,
+) -> dict[str, Any]:
+    """Minervini-style relative-strength trend versus SPY for stocks, BTC for ETH."""
+    if asset_ticker == benchmark_ticker:
+        returns = {
+            "30-day return positive": safe_float(asset_df["Return_30D_Pct"].iloc[-1]) > 0,
+            "90-day return positive": safe_float(asset_df["Return_90D_Pct"].iloc[-1]) > 0,
+            "180-day return positive": safe_float(asset_df["Return_180D_Pct"].iloc[-1]) > 0,
+        }
+        passed = sum(bool(v) for v in returns.values())
+        return {"label": f"{asset_ticker} momentum", "checks": returns, "passed": passed,
+                "total": len(returns), "ratio_series": None, "latest_ratio": np.nan}
+
+    aligned = pd.concat(
+        [asset_df["Close"].rename("Asset"), benchmark_df["Close"].rename("Benchmark")],
+        axis=1, join="inner",
+    ).dropna()
+    if len(aligned) < 200:
+        return {"label": f"{asset_ticker} vs {benchmark_ticker}", "checks": {},
+                "passed": 0, "total": 4, "ratio_series": None, "latest_ratio": np.nan}
+    aligned["Ratio"] = aligned["Asset"] / aligned["Benchmark"]
+    aligned["SMA_50"] = aligned["Ratio"].rolling(50).mean()
+    aligned["SMA_200"] = aligned["Ratio"].rolling(200).mean()
+    aligned["Return_30D"] = aligned["Ratio"].pct_change(30) * 100
+    aligned["Return_90D"] = aligned["Ratio"].pct_change(90) * 100
+    latest = aligned.iloc[-1]
+    checks = {
+        f"{asset_ticker}/{benchmark_ticker} above 50-day average": latest["Ratio"] > latest["SMA_50"],
+        f"{asset_ticker}/{benchmark_ticker} above 200-day average": latest["Ratio"] > latest["SMA_200"],
+        f"{asset_ticker}/{benchmark_ticker} 30-day return positive": latest["Return_30D"] > 0,
+        f"{asset_ticker}/{benchmark_ticker} 90-day return positive": latest["Return_90D"] > 0,
+    }
+    passed = sum(bool(v) for v in checks.values())
+    return {"label": f"{asset_ticker} relative strength vs {benchmark_ticker}", "checks": checks,
+            "passed": passed, "total": len(checks), "ratio_series": aligned,
+            "latest_ratio": safe_float(latest["Ratio"])}
+
+
+def default_daily_settings() -> Settings:
+    return Settings(
+        history_period="3y",
+        min_base_days=15,
+        max_base_days=90,
+        max_box_range_pct=15.0,
+        test_tolerance_pct=1.5,
+        minimum_high_tests=2,
+        minimum_low_tests=2,
+        breakout_buffer_pct=0.5,
+        breakout_volume_multiple=1.5,
+        dry_up_days=10,
+        baseline_volume_days=30,
+        dry_up_ratio_max=0.70,
+        atr_days=14,
+        near_high_pct=25,
+        chart_days=365,
+    )
+
+
+def analyze_daily_symbol(
+    ticker: str,
+    raw_df: pd.DataFrame,
+    settings: Settings,
+    spy_df: pd.DataFrame,
+    btc_df: pd.DataFrame,
+) -> dict[str, Any]:
+    asset_df = add_indicators(raw_df, settings)
+    minimum_rows = max(221, settings.max_base_days + 2)
+    if len(asset_df) < minimum_rows:
+        return {"Ticker": ticker, "Error": f"Only {len(asset_df)} candles"}
+
+    box = detect_current_box(asset_df, settings)
+    trend = evaluate_trend_template(asset_df, settings)
+    dry = evaluate_volume_dry_up(asset_df, settings)
+    if ticker == "BTC-USD":
+        rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "BTC-USD", btc_df)
+    elif ticker == "ETH-USD":
+        rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "BTC-USD", btc_df)
+    else:
+        rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "SPY", spy_df)
+    score = calculate_score(box, trend, dry, rs)
+    state = box.get("state", "NO VALID BOX")
+    latest_close = safe_float(asset_df["Close"].iloc[-1])
+    breakout_level = safe_float(box.get("breakout_level"))
+    distance_pct = (
+        (breakout_level - latest_close) / breakout_level * 100
+        if np.isfinite(breakout_level) and breakout_level != 0 else np.nan
+    )
+
+    probability = {"available": False, "probabilities": {}}
+    if state == "BREAKOUT WATCH":
+        probability = estimate_breakout_probability(asset_df, settings, box, trend, dry)
+
+    targets = {"available": False, "targets": []}
+    if box.get("confirmed_breakout", False):
+        targets = calculate_breakout_targets(asset_df, box)
+
+    return {
+        "Ticker": ticker,
+        "State": state,
+        "Price": latest_close,
+        "Strategy Score": score["Total"],
+        "Box High": safe_float(box.get("box_high")),
+        "Breakout Level": breakout_level,
+        "Distance to Breakout %": distance_pct,
+        "Volume Multiple": safe_float(box.get("volume_multiple")),
+        "Box Quality": safe_float(box.get("quality_score")),
+        "5-Day Probability %": probability.get("probabilities", {}).get(5, np.nan),
+        "Probability Confidence": probability.get("confidence", "N/A") if probability.get("available") else "N/A",
+        "Targets": targets.get("targets", []),
+        "Latest Date": asset_df.index[-1].strftime("%Y-%m-%d"),
+    }
+
+
+def send_daily_scan_email(config: dict[str, Any], scan_date: str, alerts: list[dict[str, Any]]) -> None:
+    confirmed = [r for r in alerts if r.get("State") == "CONFIRMED BREAKOUT"]
+    watches = [r for r in alerts if r.get("State") == "BREAKOUT WATCH"]
+    subject = f"Daily breakout scan: {len(confirmed)} confirmed / {len(watches)} watch — {scan_date}"
+    lines = [
+        f"Darvas + Minervini Daily S&P 500 + Crypto Scan — {scan_date}",
+        "",
+        f"Confirmed breakouts: {len(confirmed)}",
+        f"Breakout watches: {len(watches)}",
+        "",
+    ]
+
+    if confirmed:
+        lines += ["CONFIRMED BREAKOUTS", "=" * 60]
+        for r in sorted(confirmed, key=lambda x: x.get("Strategy Score", 0), reverse=True):
+            lines.append(
+                f"{r['Ticker']} | Price {format_currency(r['Price'])} | Score {r['Strategy Score']}/100 | "
+                f"Volume {r['Volume Multiple']:.2f}x | Breakout {format_currency(r['Breakout Level'])}"
+            )
+            for target in r.get("Targets", [])[:4]:
+                lines.append(
+                    f"  - {target.get('name', target.get('type', 'Target'))}: "
+                    f"{format_currency(safe_float(target.get('price')))} "
+                    f"({safe_float(target.get('upside_from_price_pct')):+.1f}%)"
+                )
+            lines.append("")
+
+    if watches:
+        lines += ["BREAKOUT WATCH", "=" * 60]
+        for r in sorted(watches, key=lambda x: (safe_float(x.get("5-Day Probability %"), -1), x.get("Strategy Score", 0)), reverse=True):
+            prob = r.get("5-Day Probability %")
+            prob_text = f"{prob:.0f}%" if np.isfinite(safe_float(prob)) else "N/A"
+            lines.append(
+                f"{r['Ticker']} | Price {format_currency(r['Price'])} | Score {r['Strategy Score']}/100 | "
+                f"Distance {r['Distance to Breakout %']:.2f}% | 5-day probability {prob_text} | "
+                f"Volume {r['Volume Multiple']:.2f}x"
+            )
+        lines.append("")
+
+    lines += ["Educational signals only; not investment advice."]
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = config["sender"]
+    message["To"] = config["recipient"]
+    message.set_content("\n".join(lines))
+
+    if config["use_ssl"]:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(config["smtp_host"], config["smtp_port"], context=context, timeout=30) as server:
+            server.login(config["smtp_username"], config["smtp_password"])
+            server.send_message(message)
+    else:
+        with smtplib.SMTP(config["smtp_host"], config["smtp_port"], timeout=30) as server:
+            server.starttls(context=ssl.create_default_context())
+            server.login(config["smtp_username"], config["smtp_password"])
+            server.send_message(message)
+
+
+def run_daily_market_scan(
+    settings: Settings | None = None,
+    send_email: bool = True,
+    force: bool = False,
+    progress_callback=None,
+) -> dict[str, Any]:
+    """Scan the full S&P 500 plus BTC/ETH and optionally email WATCH/CONFIRMED results."""
+    settings = settings or default_daily_settings()
+    scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily_state = load_daily_scan_state()
+    if not force and daily_state.get("last_completed_scan_utc") == scan_date:
+        return {
+            "skipped": True,
+            "scan_date": scan_date,
+            "reason": "Daily scan already completed for this UTC date.",
+            "alerts": daily_state.get("last_alerts", []),
+        }
+
+    sp500 = get_sp500_tickers()
+    scan_universe = list(dict.fromkeys(sp500 + ["BTC-USD", "ETH-USD"]))
+    download_symbols = list(dict.fromkeys(scan_universe + ["SPY"]))
+
+    market_data = download_market_data_batch(tuple(download_symbols), settings.history_period, chunk_size=50)
+    if "SPY" not in market_data or "BTC-USD" not in market_data:
+        raise RuntimeError("Benchmark data for SPY and/or BTC-USD could not be downloaded.")
+    spy_df = add_indicators(market_data["SPY"], settings)
+    btc_df = add_indicators(market_data["BTC-USD"], settings)
+
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for idx, ticker in enumerate(scan_universe, start=1):
+        if progress_callback:
+            progress_callback(idx, len(scan_universe), ticker)
+        raw = market_data.get(ticker)
+        if raw is None or raw.empty:
+            errors.append({"Ticker": ticker, "Error": "No market data"})
+            continue
+        try:
+            result = analyze_daily_symbol(ticker, raw, settings, spy_df, btc_df)
+            if result.get("Error"):
+                errors.append({"Ticker": ticker, "Error": result["Error"]})
+            else:
+                results.append(result)
+        except Exception as exc:
+            errors.append({"Ticker": ticker, "Error": str(exc)[:180]})
+
+    alerts = [r for r in results if r.get("State") in {"BREAKOUT WATCH", "CONFIRMED BREAKOUT"}]
+    email_sent = False
+    email_error = ""
+    config = get_email_config()
+    if send_email and alerts:
+        if email_configured(config):
+            try:
+                send_daily_scan_email(config, scan_date, alerts)
+                email_sent = True
+            except Exception as exc:
+                email_error = str(exc)
+        else:
+            email_error = "Email settings are incomplete."
+
+    state_for_disk = {
+        "last_completed_scan_utc": scan_date,
+        "last_alert_count": len(alerts),
+        "last_email_sent": email_sent,
+        "last_alerts": [
+            {k: v for k, v in r.items() if k != "Targets"}
+            for r in alerts
+        ],
+    }
+    save_daily_scan_state(state_for_disk)
+    return {
+        "skipped": False,
+        "scan_date": scan_date,
+        "universe_count": len(scan_universe),
+        "analyzed_count": len(results),
+        "error_count": len(errors),
+        "alerts": alerts,
+        "results": results,
+        "errors": errors,
+        "email_sent": email_sent,
+        "email_error": email_error,
+    }
+
 def main() -> None:
     st.title("📦 Darvas + Minervini Volume Breakout Scanner")
-    st.caption("Build: Multi-Ticker + Breakout Forecast V2")
+    st.caption("Build: Daily S&P 500 + Crypto Breakout Scanner V3")
     st.caption(
         "Scan crypto, stocks and ETFs with the same Darvas-box, Minervini trend, "
         "volume-contraction and breakout logic."
@@ -970,7 +1343,7 @@ def main() -> None:
         chart_days = st.slider("Chart history days", 90, 730, 365, 30)
 
         st.header("Email Alerts")
-        email_alerts_enabled = st.toggle("Send confirmed-breakout emails", value=False)
+        email_alerts_enabled = st.toggle("Send individual confirmed-breakout email for displayed ticker", value=False)
         email_config = get_email_config()
         if email_configured(email_config):
             st.success(f"SMTP configured for {email_config['recipient']}")
@@ -1009,6 +1382,51 @@ def main() -> None:
         near_high_pct=near_high_pct,
         chart_days=chart_days,
     )
+
+    st.subheader("Daily S&P 500 + Crypto Scan")
+    st.caption(
+        "The batch engine scans every current S&P 500 constituent plus BTC-USD and ETH-USD. "
+        "It emails one digest containing only BREAKOUT WATCH and CONFIRMED BREAKOUT signals."
+    )
+    daily_left, daily_right = st.columns([1, 3])
+    with daily_left:
+        run_daily_now = st.button("Run full daily scan now", type="primary", use_container_width=True)
+    with daily_right:
+        st.caption("For unattended once-daily execution, use the included GitHub Actions workflow / daily_scan.py runner.")
+
+    if run_daily_now:
+        progress = st.progress(0.0, text="Starting daily market scan...")
+        def _update_progress(done: int, total: int, symbol: str) -> None:
+            progress.progress(min(done / max(total, 1), 1.0), text=f"Scanning {symbol} ({done}/{total})")
+        try:
+            daily_result = run_daily_market_scan(
+                settings=settings, send_email=True, force=True, progress_callback=_update_progress
+            )
+            progress.progress(1.0, text="Daily scan complete")
+            alerts = daily_result.get("alerts", [])
+            confirmed = sum(1 for r in alerts if r.get("State") == "CONFIRMED BREAKOUT")
+            watches = sum(1 for r in alerts if r.get("State") == "BREAKOUT WATCH")
+            st.success(
+                f"Scanned {daily_result.get('analyzed_count', 0)} symbols: "
+                f"{confirmed} confirmed breakout(s), {watches} breakout watch(es)."
+            )
+            if daily_result.get("email_sent"):
+                st.success("Daily alert digest email sent.")
+            elif daily_result.get("email_error"):
+                st.warning(f"Scan completed, but email was not sent: {daily_result['email_error']}")
+            if alerts:
+                alert_df = pd.DataFrame([{
+                    "Ticker": r.get("Ticker"),
+                    "State": r.get("State"),
+                    "Price": r.get("Price"),
+                    "Score": r.get("Strategy Score"),
+                    "Distance %": r.get("Distance to Breakout %"),
+                    "Volume x": r.get("Volume Multiple"),
+                    "5-Day Prob. %": r.get("5-Day Probability %"),
+                } for r in alerts])
+                st.dataframe(alert_df, hide_index=True, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Daily scan failed: {exc}")
 
     try:
         with st.spinner(f"Loading {asset_name} ({ticker}) daily candles..."):
@@ -1414,7 +1832,7 @@ recipient = "destination@example.com"
 use_ssl = true
 ```
 
-For Gmail, use an **App Password**, not your normal account password. The scanner sends only once for each unique ticker, candle date and breakout level. A deployed Streamlit app must rerun periodically for automatic checking; otherwise alerts are evaluated when the page is opened or refreshed.
+For Gmail, use an **App Password**, not your normal account password. The displayed-ticker alert sends once for each unique ticker/candle/breakout level. The daily batch scanner sends one digest containing all BREAKOUT WATCH and CONFIRMED BREAKOUT states. For dependable unattended daily execution, run daily_scan.py from the included GitHub Actions workflow.
             """
         )
 
