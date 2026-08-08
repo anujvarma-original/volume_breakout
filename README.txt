@@ -1,5 +1,12 @@
 FAST DAILY DARVAS + MINERVINI SCAN
 
+Total Score	Box Quality	Interpretation
+85+	80+	⭐ Highest-interest setup
+75–84	70+	Strong candidate
+65–74	70+	Worth watching
+<65	Any	Lower priority
+High	<60	Be cautious — weak Darvas structure
+
 Keep your existing app.py in the repository. Add:
   fast_scan_batch.py
   send_scan_digest.py
