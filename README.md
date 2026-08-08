@@ -10,6 +10,14 @@ A Streamlit dashboard for current-state Darvas-box and Minervini-style analysis.
 - On-demand S&P 500 constituent scanning
 - On-demand Nasdaq-100 constituent scanning
 
+## Total Score vs. Box Quality
+Total Score	Box Quality	Interpretation
+85+	80+	⭐ Highest-interest setup
+75–84	70+	Strong candidate
+65–74	70+	Worth watching
+<65	Any	Lower priority
+High	<60	Be cautious — weak Darvas structure
+
 ## Included
 
 - Automatic dynamic Darvas base detection
