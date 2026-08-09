@@ -1308,6 +1308,59 @@ def run_daily_market_scan(
     }
 
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_short_squeeze_snapshot(ticker: str, asset_df=None) -> dict[str, Any]:
+    r={"applicable":True,"available":False,"score":np.nan,"label":"N/A","short_percent_float":np.nan,
+       "days_to_cover":np.nan,"short_change_pct":np.nan,"relative_volume":np.nan,"components":{}}
+    if ticker.endswith("-USD") or ticker in {"SPY","QQQ","DIA","IWM","MDY","RSP"}:
+        r["applicable"]=False; return r
+    try:
+        info=yf.Ticker(ticker).info or {}
+        sp=safe_float(info.get("shortPercentOfFloat")); dc=safe_float(info.get("shortRatio"))
+        ss=safe_float(info.get("sharesShort")); pr=safe_float(info.get("sharesShortPriorMonth"))
+        fl=safe_float(info.get("floatShares"))
+        ch=(ss-pr)/pr*100 if np.isfinite(ss) and np.isfinite(pr) and pr>0 else np.nan
+        rv=mo=np.nan
+        if asset_df is not None and len(asset_df)>=21:
+            av=safe_float(asset_df["Volume"].iloc[-21:-1].mean()); lv=safe_float(asset_df["Volume"].iloc[-1])
+            rv=lv/av if np.isfinite(av) and av>0 else np.nan
+            c0=safe_float(asset_df["Close"].iloc[-21]); c1=safe_float(asset_df["Close"].iloc[-1])
+            mo=(c1/c0-1)*100 if np.isfinite(c0) and c0>0 else np.nan
+        c={}
+        if np.isfinite(sp): c["sf"]=max(0,min(100,(sp-.05)/.25*100))
+        if np.isfinite(dc): c["dc"]=max(0,min(100,(dc-1)/9*100))
+        if np.isfinite(ch): c["chg"]=max(0,min(100,(ch+10)/40*100))
+        if np.isfinite(fl) and fl>0: c["float"]=max(0,min(100,(500e6-fl)/480e6*100))
+        if np.isfinite(rv): c["rv"]=max(0,min(100,(rv-.7)/1.8*100))
+        if np.isfinite(mo): c["mom"]=max(0,min(100,(mo+5)/25*100))
+        wt={"sf":35,"dc":20,"chg":10,"float":10,"rv":15,"mom":10}
+        aw=sum(wt[k] for k in c)
+        sc=sum(c[k]*wt[k] for k in c)/aw if aw else np.nan
+        r.update({"available":bool(c),"score":sc,"label":"HIGH" if sc>=70 else "MODERATE" if sc>=45 else "LOW",
+                  "short_percent_float":sp,"days_to_cover":dc,"short_change_pct":ch,"relative_volume":rv,"components":c})
+    except Exception as e: r["error"]=str(e)
+    return r
+
+def calculate_score_with_squeeze(base, sq):
+    if not sq.get("available") or not np.isfinite(safe_float(sq.get("score"))):
+        x=dict(base); x["Short Squeeze"]=None; return x
+    bp=base.get("Box",0); tp=round(base.get("Trend",0)*25/30); dp=round(base.get("Dry-up",0)*10/15)
+    rp=base.get("Relative strength",0); br=base.get("Breakout",0); sp=round(10*safe_float(sq["score"])/100)
+    return {"Box":bp,"Trend":tp,"Dry-up":dp,"Relative strength":rp,"Breakout":br,"Short Squeeze":sp,
+            "Total":bp+tp+dp+rp+br+sp}
+
+def render_short_squeeze_snapshot(ticker, asset_df):
+    sq=fetch_short_squeeze_snapshot(ticker,asset_df)
+    st.subheader("Short Squeeze Potential")
+    if not sq["applicable"]: st.info("Short-float squeeze metrics are not applicable to this symbol."); return
+    if not sq["available"]: st.caption("Short-interest data unavailable."); return
+    sc=safe_float(sq["score"]); sp=safe_float(sq["short_percent_float"]); dc=safe_float(sq["days_to_cover"])
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Squeeze Potential",f"{sc:.0f}/100"); c2.metric("Level",sq["label"])
+    c3.metric("Short % Float",f"{sp*100:.1f}%" if np.isfinite(sp) else "N/A")
+    c4.metric("Days to Cover",f"{dc:.1f}" if np.isfinite(dc) else "N/A")
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_earnings_snapshot(ticker: str) -> dict[str, Any]:
     result={"applicable":True,"next_earnings":None,"days_to_earnings":None,"history":[],
