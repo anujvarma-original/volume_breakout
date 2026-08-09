@@ -1706,6 +1706,54 @@ def main() -> None:
 
     with tabs[5]:
         st.subheader("Breakout Forecast")
+
+        # Compact upside summary for WATCH / CONFIRMED states
+        forecast_targets = calculate_breakout_targets(asset_df, box_result)
+        if box_result.get("state") in {
+            "BREAKOUT WATCH",
+            "PRICE BREAKOUT / WEAK VOLUME",
+            "CONFIRMED BREAKOUT",
+        } and forecast_targets.get("targets"):
+            projected = forecast_targets["targets"][0]
+            projected_price = safe_float(projected.get("price"))
+            current_price = safe_float(box_result.get("latest_close"))
+            upside_pct = (
+                (projected_price / current_price - 1) * 100
+                if np.isfinite(projected_price) and np.isfinite(current_price) and current_price > 0
+                else np.nan
+            )
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Projected Target", format_currency(projected_price))
+            c2.metric(
+                "Potential Upside",
+                f"{upside_pct:.2f}%"
+                if np.isfinite(upside_pct)
+                else "N/A",
+            )
+            c3.metric("Target Basis", projected.get("name", "Structural target"))
+
+            darvas_target = next(
+                (t for t in forecast_targets["targets"] if t.get("name") == "Darvas target"),
+                None,
+            )
+            if darvas_target:
+                darvas_price = safe_float(darvas_target.get("price"))
+                darvas_upside = (
+                    (darvas_price / current_price - 1) * 100
+                    if np.isfinite(darvas_price) and np.isfinite(current_price) and current_price > 0
+                    else np.nan
+                )
+                if np.isfinite(darvas_upside):
+                    st.caption(
+                        f"Darvas measured target: {format_currency(darvas_price)} "
+                        f"({darvas_upside:.2f}% potential upside)"
+                    )
+                else:
+                    st.caption(
+                        f"Darvas measured target: {format_currency(darvas_price)}"
+                    )
+
         if box_result.get("state") == "BREAKOUT WATCH":
             if breakout_probability.get("available"):
                 probs = breakout_probability["probabilities"]
