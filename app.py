@@ -1182,8 +1182,10 @@ def send_daily_scan_email(config: dict[str, Any], scan_date: str, alerts: list[d
         lines += ["CONFIRMED BREAKOUTS", "=" * 60]
         for r in sorted(confirmed, key=lambda x: x.get("Strategy Score", 0), reverse=True):
             lines.append(
-                f"{r['Ticker']} | Price {format_currency(r['Price'])} | Score {r['Strategy Score']}/100 | "
-                f"Volume {r['Volume Multiple']:.2f}x | Breakout {format_currency(r['Breakout Level'])}"
+                f"{r['Ticker']} | Price {format_currency(r['Price'])} | Overall {r['Strategy Score']}/100 | "
+                f"Core {r.get('Core Score', r['Strategy Score'])}/100 | "
+                f"Squeeze {safe_float(r.get('Short Squeeze Potential')):.0f}/100 ({r.get('Short Squeeze Label','N/A')}) | "
+                f"SI Bonus +{r.get('Squeeze Bonus',0)} | Volume {r['Volume Multiple']:.2f}x | Breakout {format_currency(r['Breakout Level'])}"
             )
             for target in r.get("Targets", [])[:4]:
                 lines.append(
@@ -1199,8 +1201,10 @@ def send_daily_scan_email(config: dict[str, Any], scan_date: str, alerts: list[d
             prob = r.get("5-Day Probability %")
             prob_text = f"{prob:.0f}%" if np.isfinite(safe_float(prob)) else "N/A"
             lines.append(
-                f"{r['Ticker']} | Price {format_currency(r['Price'])} | Score {r['Strategy Score']}/100 | "
-                f"Distance {r['Distance to Breakout %']:.2f}% | 5-day probability {prob_text} | "
+                f"{r['Ticker']} | Price {format_currency(r['Price'])} | Overall {r['Strategy Score']}/100 | "
+                f"Core {r.get('Core Score', r['Strategy Score'])}/100 | "
+                f"Squeeze {safe_float(r.get('Short Squeeze Potential')):.0f}/100 ({r.get('Short Squeeze Label','N/A')}) | "
+                f"SI Bonus +{r.get('Squeeze Bonus',0)} | Distance {r['Distance to Breakout %']:.2f}% | 5-day probability {prob_text} | "
                 f"Volume {r['Volume Multiple']:.2f}x"
             )
         lines.append("")
@@ -1271,6 +1275,23 @@ def run_daily_market_scan(
             errors.append({"Ticker": ticker, "Error": str(exc)[:180]})
 
     alerts = [r for r in results if r.get("State") in {"BREAKOUT WATCH", "CONFIRMED BREAKOUT"}]
+
+    # Fetch slower short-interest fundamentals only for actionable candidates. This
+    # keeps the full S&P scan practical and ensures low-short-interest breakouts
+    # are never filtered out before the squeeze bonus is considered.
+    for r in alerts:
+        ticker = r.get("Ticker", "")
+        raw = market_data.get(ticker)
+        asset_df = add_indicators(raw, settings) if raw is not None and not raw.empty else None
+        sq = fetch_short_squeeze_snapshot(ticker, asset_df)
+        core = int(r.get("Strategy Score", 0))
+        bonus = get_squeeze_bonus(safe_float(sq.get("score"))) if sq.get("available") else 0
+        r["Core Score"] = core
+        r["Short Squeeze Potential"] = safe_float(sq.get("score")) if sq.get("available") else np.nan
+        r["Short Squeeze Label"] = sq.get("label", "N/A") if sq.get("available") else "N/A"
+        r["Squeeze Bonus"] = bonus
+        r["Strategy Score"] = min(100, core + bonus)
+
     email_sent = False
     email_error = ""
     config = get_email_config()
@@ -1342,16 +1363,37 @@ def fetch_short_squeeze_snapshot(ticker: str, asset_df=None) -> dict[str, Any]:
     except Exception as e: r["error"]=str(e)
     return r
 
-def calculate_score_with_squeeze(base, sq):
-    if not sq.get("available") or not np.isfinite(safe_float(sq.get("score"))):
-        x=dict(base); x["Short Squeeze"]=None; return x
-    bp=base.get("Box",0); tp=round(base.get("Trend",0)*25/30); dp=round(base.get("Dry-up",0)*10/15)
-    rp=base.get("Relative strength",0); br=base.get("Breakout",0); sp=round(10*safe_float(sq["score"])/100)
-    return {"Box":bp,"Trend":tp,"Dry-up":dp,"Relative strength":rp,"Breakout":br,"Short Squeeze":sp,
-            "Total":bp+tp+dp+rp+br+sp}
+def get_squeeze_bonus(squeeze_score: float) -> int:
+    """Return a 0-5 bonus. Short interest can help a setup, but never penalize it."""
+    score = safe_float(squeeze_score)
+    if not np.isfinite(score):
+        return 0
+    if score >= 90:
+        return 5
+    if score >= 85:
+        return 4
+    if score >= 75:
+        return 3
+    if score >= 65:
+        return 2
+    if score >= 50:
+        return 1
+    return 0
 
-def render_short_squeeze_snapshot(ticker, asset_df):
-    sq = fetch_short_squeeze_snapshot(ticker, asset_df)
+def calculate_score_with_squeeze(base, sq):
+    """Preserve the original 0-100 breakout score and add only a squeeze bonus."""
+    core_total = int(base.get("Total", 0))
+    squeeze_score = safe_float(sq.get("score")) if sq else np.nan
+    bonus = get_squeeze_bonus(squeeze_score) if sq and sq.get("available") else 0
+    x = dict(base)
+    x["Core Total"] = core_total
+    x["Short Squeeze Score"] = squeeze_score if np.isfinite(squeeze_score) else None
+    x["Short Squeeze Bonus"] = bonus
+    x["Total"] = min(100, core_total + bonus)
+    return x
+
+def render_short_squeeze_snapshot(ticker, asset_df, sq=None):
+    sq = sq or fetch_short_squeeze_snapshot(ticker, asset_df)
     st.subheader("Short Squeeze Potential")
     if not sq.get("applicable", True):
         st.metric("Short Squeeze Potential", "N/A")
@@ -1550,7 +1592,10 @@ def main() -> None:
                     "Ticker": r.get("Ticker"),
                     "State": r.get("State"),
                     "Price": r.get("Price"),
-                    "Score": r.get("Strategy Score"),
+                    "Overall Score": r.get("Strategy Score"),
+                    "Core Score": r.get("Core Score", r.get("Strategy Score")),
+                    "Squeeze": r.get("Short Squeeze Potential"),
+                    "SI Bonus": r.get("Squeeze Bonus", 0),
                     "Distance %": r.get("Distance to Breakout %"),
                     "Volume x": r.get("Volume Multiple"),
                     "5-Day Prob. %": r.get("5-Day Probability %"),
@@ -1587,7 +1632,9 @@ def main() -> None:
     trend_result = evaluate_trend_template(asset_df, settings)
     dry_up_result = evaluate_volume_dry_up(asset_df, settings)
     rs_result = evaluate_relative_strength(ticker, asset_df, btc_df)
-    score = calculate_score(box_result, trend_result, dry_up_result, rs_result)
+    core_score = calculate_score(box_result, trend_result, dry_up_result, rs_result)
+    squeeze_snapshot = fetch_short_squeeze_snapshot(ticker, asset_df)
+    score = calculate_score_with_squeeze(core_score, squeeze_snapshot)
 
     breakout_probability = (
         estimate_breakout_probability(asset_df, settings, box_result, trend_result, dry_up_result)
@@ -1625,33 +1672,40 @@ def main() -> None:
         "Crypto daily candles from the data source may still be incomplete before the UTC day closes."
     )
 
-    metric_columns = st.columns(7)
+    metric_columns = st.columns(9)
     metric_columns[0].metric("Price", format_currency(latest["Close"]), f"{daily_change:.2f}%")
-    metric_columns[1].metric("Strategy Score", f"{score['Total']}/100")
-    metric_columns[2].metric("State", box_result.get("state", "N/A"))
-    metric_columns[3].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
-    metric_columns[4].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
-    metric_columns[5].metric(
+    metric_columns[1].metric("Overall Score", f"{score['Total']}/100")
+    metric_columns[2].metric("Core Score", f"{score['Core Total']}/100")
+    sq_display = safe_float(squeeze_snapshot.get("score"))
+    metric_columns[3].metric(
+        "Short Squeeze",
+        f"{sq_display:.0f}/100" if np.isfinite(sq_display) else "N/A",
+        f"+{score['Short Squeeze Bonus']} bonus" if score['Short Squeeze Bonus'] else None,
+    )
+    metric_columns[4].metric("State", box_result.get("state", "N/A"))
+    metric_columns[5].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
+    metric_columns[6].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
+    metric_columns[7].metric(
         "Breakout Volume",
         f"{safe_float(box_result.get('volume_multiple')):.2f}×"
         if np.isfinite(safe_float(box_result.get("volume_multiple")))
         else "N/A",
     )
     if breakout_probability.get("available"):
-        metric_columns[6].metric(
+        metric_columns[8].metric(
             "5-Day Breakout Prob.",
             f"{breakout_probability['probabilities'].get(5, np.nan):.0f}%",
             breakout_probability.get("confidence", ""),
         )
     elif breakout_targets.get("available"):
         first_target = breakout_targets["targets"][0]
-        metric_columns[6].metric(
+        metric_columns[8].metric(
             "Nearest Target",
             format_currency(first_target["price"]),
             f"{first_target['upside_from_price_pct']:+.1f}%",
         )
     else:
-        metric_columns[6].metric("Forecast", "N/A")
+        metric_columns[8].metric("Forecast", "N/A")
 
     tabs = st.tabs(
         [
@@ -2020,7 +2074,7 @@ For Gmail, use an **App Password**, not your normal account password. The displa
         "and the current UTC daily candle may be incomplete."
     )
 
-    render_short_squeeze_snapshot(ticker, asset_df)
+    render_short_squeeze_snapshot(ticker, asset_df, squeeze_snapshot)
     render_earnings_snapshot(ticker)
 
 
