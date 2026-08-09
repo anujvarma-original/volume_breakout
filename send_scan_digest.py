@@ -167,3 +167,25 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+def earnings_text(r: dict) -> list[str]:
+    out=[]
+    if r.get("Upcoming ER"):
+        d=r.get("Days to ER")
+        s=f"  - Earnings: {r['Upcoming ER']}"
+        if isinstance(d,int): s+=f" ({d} days)"
+        if isinstance(d,int) and 0<=d<=7: s+="  **EARNINGS SOON**"
+        out.append(s)
+    hist=r.get("Earnings History") or []
+    if hist:
+        out.append(f"  - Last 4: {r.get('ER Beats',0)} beat / {r.get('ER Meets',0)} met / {r.get('ER Misses',0)} miss")
+        for h in hist[:4]:
+            def f(v):
+                try: return f"{float(v):.2f}"
+                except: return "N/A"
+            try: sp=f"{float(h.get('Surprise %')):+.1f}%"
+            except: sp="N/A"
+            out.append(f"      {h.get('Date','')} | expected {f(h.get('Expected EPS'))} | actual {f(h.get('Actual EPS'))} | {sp} | {h.get('Result','')}")
+    return out
+
+

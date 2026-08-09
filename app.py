@@ -1307,6 +1307,68 @@ def run_daily_market_scan(
         "email_error": email_error,
     }
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_earnings_snapshot(ticker: str) -> dict[str, Any]:
+    result={"applicable":True,"next_earnings":None,"days_to_earnings":None,"history":[],
+            "beats":0,"meets":0,"misses":0,"avg_surprise_pct":np.nan,"error":None}
+    if ticker.endswith("-USD") or ticker in {"SPY","QQQ","DIA","IWM","MDY","RSP"}:
+        result["applicable"]=False
+        return result
+    try:
+        dates=yf.Ticker(ticker).get_earnings_dates(limit=12)
+        if dates is None or dates.empty:
+            return result
+        now=pd.Timestamp.now(tz="UTC")
+        idx=pd.to_datetime(dates.index,utc=True,errors="coerce")
+        future=[d for d in idx if pd.notna(d) and d>=now]
+        if future:
+            nxt=min(future)
+            result["next_earnings"]=nxt.date().isoformat()
+            result["days_to_earnings"]=int((nxt.normalize()-now.normalize()).days)
+        completed=dates.copy()
+        completed["_date"]=idx
+        completed=completed[completed["_date"]<now].sort_values("_date",ascending=False)
+        surprises=[]
+        for _,r in completed.head(4).iterrows():
+            est=safe_float(r.get("EPS Estimate")); act=safe_float(r.get("Reported EPS"))
+            surprise=np.nan; outcome="N/A"
+            if np.isfinite(est) and np.isfinite(act):
+                if abs(est)>1e-12:
+                    surprise=(act-est)/abs(est)*100
+                    surprises.append(surprise)
+                tol=max(.005,abs(est)*.0025)
+                if act-est>tol: outcome="Beat"; result["beats"]+=1
+                elif act-est<-tol: outcome="Miss"; result["misses"]+=1
+                else: outcome="Met"; result["meets"]+=1
+            dt=r.get("_date")
+            result["history"].append({"Date":dt.date().isoformat() if pd.notna(dt) else "",
+                "Expected EPS":est,"Actual EPS":act,"Surprise %":surprise,"Result":outcome})
+        if surprises: result["avg_surprise_pct"]=float(np.mean(surprises))
+    except Exception as exc:
+        result["error"]=str(exc)
+    return result
+
+def render_earnings_snapshot(ticker: str) -> None:
+    er=fetch_earnings_snapshot(ticker)
+    st.subheader("Earnings Context")
+    if not er["applicable"]:
+        st.info("Corporate earnings are not applicable to this crypto or index ETF symbol.")
+        return
+    days=er.get("days_to_earnings")
+    avg=safe_float(er.get("avg_surprise_pct"))
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Upcoming ER",er.get("next_earnings") or "Unknown")
+    c2.metric("Days to ER",str(days) if isinstance(days,int) else "Unknown")
+    c3.metric("Last 4",f"{er['beats']} Beat / {er['meets']} Met / {er['misses']} Miss")
+    c4.metric("Avg EPS Surprise",f"{avg:+.2f}%" if np.isfinite(avg) else "N/A")
+    if isinstance(days,int) and 0<=days<=7:
+        st.warning(f"Earnings are scheduled in {days} day(s).")
+    if er["history"]:
+        st.dataframe(pd.DataFrame(er["history"]),use_container_width=True,hide_index=True)
+    elif er.get("error"):
+        st.caption(f"Earnings data unavailable: {er['error']}")
+
 def main() -> None:
     st.title("📦 Darvas + Minervini Volume Breakout Scanner")
     st.caption("Build: Daily S&P 500 + Crypto Breakout Scanner V3")
@@ -1903,6 +1965,8 @@ For Gmail, use an **App Password**, not your normal account password. The displa
         "Educational scanner only—not investment advice. Signals can fail, volume data varies by source, "
         "and the current UTC daily candle may be incomplete."
     )
+
+    render_earnings_snapshot(ticker)
 
 
 if __name__ == "__main__":
