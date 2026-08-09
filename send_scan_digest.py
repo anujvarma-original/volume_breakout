@@ -52,6 +52,48 @@ def email_config() -> dict[str, Any]:
     }
 
 
+def enrichment_lines(r: dict) -> list[str]:
+    out = []
+
+    sq = num(r.get("Short Squeeze Potential"))
+    out.append(
+        f"  - Short Squeeze Potential: {sq:.0f}/100"
+        if sq is not None else
+        "  - Short Squeeze Potential: N/A"
+    )
+
+    if r.get("Upcoming ER"):
+        days = r.get("Days to ER")
+        s = f"  - Earnings: {r['Upcoming ER']}"
+        if isinstance(days, int):
+            s += f" ({days} days)"
+            if 0 <= days <= 7:
+                s += " **EARNINGS SOON**"
+        out.append(s)
+
+    history = r.get("Earnings History") or []
+    if history:
+        out.append(
+            f"  - Last 4 ER: {r.get('ER Beats',0)} beat / "
+            f"{r.get('ER Meets',0)} met / {r.get('ER Misses',0)} miss"
+        )
+        for h in history[:4]:
+            def fmt(v):
+                try:
+                    return f"{float(v):.2f}"
+                except Exception:
+                    return "N/A"
+            try:
+                surprise = f"{float(h.get('Surprise %')):+.1f}%"
+            except Exception:
+                surprise = "N/A"
+            out.append(
+                f"      {h.get('Date','')} | expected {fmt(h.get('Expected EPS'))} | "
+                f"actual {fmt(h.get('Actual EPS'))} | {surprise} | {h.get('Result','')}"
+            )
+    return out
+
+
 def main() -> int:
     files = sorted(Path("scan_results").rglob("batch_*.json"))
     if not files:
@@ -105,6 +147,7 @@ def main() -> int:
                 up = num(target.get("upside_from_price_pct"))
                 up_text = "N/A" if up is None else f"{up:+.1f}%"
                 lines.append(f"  - {target.get('name', 'Target')}: {money(target.get('price'))} ({up_text})")
+            lines.extend(enrichment_lines(r))
             lines.append("")
 
     if watches:
@@ -128,7 +171,8 @@ def main() -> int:
                         f"  - Darvas measured target: {money(darvas.get('price'))} "
                         f"({pct(darvas.get('upside_from_price_pct'), 1)} from current price)"
                     )
-        lines.append("")
+            lines.extend(enrichment_lines(r))
+            lines.append("")
 
     if not alerts:
         lines.append("No BREAKOUT WATCH or CONFIRMED BREAKOUT signals today.")
@@ -167,28 +211,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-def earnings_text(r: dict) -> list[str]:
-    out=[]
-    sq=num(r.get("Short Squeeze Potential"))
-    if sq is not None:
-        out.append(f"  - Short Squeeze Potential: {sq:.0f}/100")
-    if r.get("Upcoming ER"):
-        d=r.get("Days to ER")
-        s=f"  - Earnings: {r['Upcoming ER']}"
-        if isinstance(d,int): s+=f" ({d} days)"
-        if isinstance(d,int) and 0<=d<=7: s+="  **EARNINGS SOON**"
-        out.append(s)
-    hist=r.get("Earnings History") or []
-    if hist:
-        out.append(f"  - Last 4: {r.get('ER Beats',0)} beat / {r.get('ER Meets',0)} met / {r.get('ER Misses',0)} miss")
-        for h in hist[:4]:
-            def f(v):
-                try: return f"{float(v):.2f}"
-                except: return "N/A"
-            try: sp=f"{float(h.get('Surprise %')):+.1f}%"
-            except: sp="N/A"
-            out.append(f"      {h.get('Date','')} | expected {f(h.get('Expected EPS'))} | actual {f(h.get('Actual EPS'))} | {sp} | {h.get('Result','')}")
-    return out
-
-

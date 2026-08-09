@@ -79,7 +79,7 @@ def analyze_fast_symbol(
         except Exception:
             targets = {"targets": []}
 
-    return {
+    row = {
         "Ticker": ticker,
         "State": state,
         "Price": finite(latest_close),
@@ -99,6 +99,29 @@ def analyze_fast_symbol(
         ],
         "Latest Date": asset_df.index[-1].strftime("%Y-%m-%d"),
     }
+
+    if state in {"BREAKOUT WATCH", "CONFIRMED BREAKOUT"}:
+        # Standalone squeeze score; does not alter Strategy Score.
+        try:
+            sq = scanner.fetch_short_squeeze_snapshot(ticker, asset_df)
+            row["Short Squeeze Potential"] = finite(sq.get("score"))
+        except Exception:
+            row["Short Squeeze Potential"] = None
+
+        # Earnings enrichment only for alert candidates.
+        try:
+            er = scanner.fetch_earnings_snapshot(ticker)
+            row["Upcoming ER"] = er.get("next_earnings")
+            row["Days to ER"] = er.get("days_to_earnings")
+            row["Earnings History"] = er.get("history", [])
+            row["ER Beats"] = er.get("beats", 0)
+            row["ER Meets"] = er.get("meets", 0)
+            row["ER Misses"] = er.get("misses", 0)
+            row["Avg EPS Surprise %"] = finite(er.get("avg_surprise_pct"))
+        except Exception:
+            pass
+
+    return row
 
 
 def main() -> int:
