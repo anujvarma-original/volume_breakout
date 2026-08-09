@@ -85,7 +85,7 @@ def main() -> int:
     scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     subject = f"Daily breakout scan: {len(confirmed)} confirmed / {len(watches)} watch — {scan_date}"
     lines = [
-        f"Darvas + Minervini Daily S&P 500 + BTC/ETH Scan — {scan_date}",
+        f"Darvas + Minervini Daily S&P 500 + Index Proxies + BTC/ETH Scan — {scan_date}",
         "",
         f"Analyzed: {total_analyzed}",
         f"Errors: {total_errors}",
@@ -115,6 +115,19 @@ def main() -> int:
                 f"Distance {pct(r.get('Distance to Breakout %'))} | Volume {multiple(r.get('Volume Multiple'))} | "
                 f"Box Quality {num(r.get('Box Quality')) or 0:.1f}/100"
             )
+            targets = r.get("Targets", [])
+            if targets:
+                nearest = targets[0]
+                lines.append(
+                    f"  - Potential post-breakout target: {money(nearest.get('price'))} "
+                    f"({pct(nearest.get('upside_from_price_pct'), 1)} from current price)"
+                )
+                darvas = next((t for t in targets if t.get("name") == "Darvas target"), None)
+                if darvas and darvas is not nearest:
+                    lines.append(
+                        f"  - Darvas measured target: {money(darvas.get('price'))} "
+                        f"({pct(darvas.get('upside_from_price_pct'), 1)} from current price)"
+                    )
         lines.append("")
 
     if not alerts:

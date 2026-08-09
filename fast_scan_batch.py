@@ -19,6 +19,9 @@ import numpy as np
 import app as scanner
 
 
+INDEX_PROXIES = ["SPY", "QQQ", "DIA", "IWM", "MDY", "RSP"]
+
+
 def finite(value: Any, default: float | None = None) -> float | None:
     try:
         x = float(value)
@@ -67,9 +70,10 @@ def analyze_fast_symbol(
         else np.nan
     )
 
-    # Target calculation is inexpensive and useful for confirmed breakouts.
+    # Target calculation is inexpensive. For BREAKOUT WATCH it represents
+    # the hypothetical post-breakout target stack if price clears the box.
     targets = {"targets": []}
-    if box.get("confirmed_breakout", False):
+    if state in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}:
         try:
             targets = scanner.calculate_breakout_targets(asset_df, box)
         except Exception:
@@ -111,11 +115,12 @@ def main() -> int:
     end = start + args.batch_size
     batch = sp500[start:end]
 
-    # Put BTC and ETH in the final/overflow batch (index 10 for size 50).
-    # This guarantees they are scanned once and only once.
+    # Put index ETF proxies plus BTC and ETH in the final stock batch.
+    # ETF proxies are used instead of raw index symbols because this scanner
+    # relies on tradable volume for dry-up and breakout confirmation.
     total_stock_batches = math.ceil(len(sp500) / args.batch_size)
     if args.batch_index == total_stock_batches - 1:
-        batch = list(dict.fromkeys(batch + ["BTC-USD", "ETH-USD"]))
+        batch = list(dict.fromkeys(batch + INDEX_PROXIES + ["BTC-USD", "ETH-USD"]))
 
     if not batch:
         print(f"Batch {args.batch_index}: no symbols assigned")

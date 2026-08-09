@@ -737,8 +737,17 @@ def find_prior_resistance_levels(
         return []
 
     current_price = safe_float(box_result.get("latest_close"))
+    breakout_level = safe_float(box_result.get("breakout_level"))
     if not np.isfinite(current_price):
         return []
+
+    # For BREAKOUT WATCH, resistance targets should be above the hypothetical
+    # breakout level, not merely above today's price.
+    minimum_target_price = (
+        max(current_price, breakout_level)
+        if np.isfinite(breakout_level)
+        else current_price
+    )
 
     history = df.copy()
     box_start = box_result.get("box_start")
@@ -752,7 +761,7 @@ def find_prior_resistance_levels(
     vals = highs.to_numpy()
     for i in range(swing_order, len(vals) - swing_order):
         center = vals[i]
-        if not np.isfinite(center) or center <= current_price:
+        if not np.isfinite(center) or center <= minimum_target_price:
             continue
         if center >= np.nanmax(vals[i - swing_order:i + swing_order + 1]):
             candidates.append(float(center))
@@ -774,7 +783,7 @@ def find_prior_resistance_levels(
             clusters.append([price])
 
     levels = [float(np.mean(c)) for c in clusters]
-    levels = [x for x in levels if x > current_price]
+    levels = [x for x in levels if x > minimum_target_price]
     return levels[:max_levels]
 
 
@@ -782,7 +791,7 @@ def calculate_breakout_targets(
     df: pd.DataFrame,
     box_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build structural upside targets for a confirmed or price-only breakout."""
+    """Build structural upside targets for a watch, price-only, or confirmed breakout."""
     if not box_result.get("valid"):
         return {"available": False, "targets": []}
 
@@ -810,8 +819,9 @@ def calculate_breakout_targets(
         target["upside_from_price_pct"] = (target["price"] / latest_close - 1) * 100
         target["upside_from_breakout_pct"] = (target["price"] / breakout_level - 1) * 100
 
+    minimum_target_price = max(latest_close, breakout_level)
     targets = sorted(
-        [t for t in targets if np.isfinite(t["price"]) and t["price"] > latest_close],
+        [t for t in targets if np.isfinite(t["price"]) and t["price"] > minimum_target_price],
         key=lambda t: t["price"],
     )
     return {
@@ -1136,7 +1146,7 @@ def analyze_daily_symbol(
         probability = estimate_breakout_probability(asset_df, settings, box, trend, dry)
 
     targets = {"available": False, "targets": []}
-    if box.get("confirmed_breakout", False):
+    if state in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}:
         targets = calculate_breakout_targets(asset_df, box)
 
     return {
@@ -1470,7 +1480,7 @@ def main() -> None:
     )
     breakout_targets = (
         calculate_breakout_targets(asset_df, box_result)
-        if box_result.get("confirmed_breakout") or box_result.get("price_breakout")
+        if box_result.get("state") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
         else {"available": False, "targets": []}
     )
 
