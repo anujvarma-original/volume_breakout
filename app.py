@@ -2020,6 +2020,7 @@ For Gmail, use an **App Password**, not your normal account password. The displa
         "and the current UTC daily candle may be incomplete."
     )
 
+    render_short_squeeze_snapshot(ticker, asset_df)
     render_earnings_snapshot(ticker)
 
 
