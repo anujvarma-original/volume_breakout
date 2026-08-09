@@ -1351,17 +1351,18 @@ def calculate_score_with_squeeze(base, sq):
             "Total":bp+tp+dp+rp+br+sp}
 
 def render_short_squeeze_snapshot(ticker, asset_df):
-    sq=fetch_short_squeeze_snapshot(ticker,asset_df)
+    sq = fetch_short_squeeze_snapshot(ticker, asset_df)
     st.subheader("Short Squeeze Potential")
-    if not sq["applicable"]: st.info("Short-float squeeze metrics are not applicable to this symbol."); return
-    if not sq["available"]: st.caption("Short-interest data unavailable."); return
-    sc=safe_float(sq["score"]); sp=safe_float(sq["short_percent_float"]); dc=safe_float(sq["days_to_cover"])
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("Squeeze Potential",f"{sc:.0f}/100"); c2.metric("Level",sq["label"])
-    c3.metric("Short % Float",f"{sp*100:.1f}%" if np.isfinite(sp) else "N/A")
-    c4.metric("Days to Cover",f"{dc:.1f}" if np.isfinite(dc) else "N/A")
+    if not sq.get("applicable", True):
+        st.metric("Short Squeeze Potential", "N/A")
+        return
+    score = safe_float(sq.get("score"))
+    st.metric(
+        "Short Squeeze Potential",
+        f"{score:.0f}/100" if np.isfinite(score) else "N/A",
+    )
 
-@st.cache_data(ttl=21600, show_spinner=False)
+
 def fetch_earnings_snapshot(ticker: str) -> dict[str, Any]:
     result={"applicable":True,"next_earnings":None,"days_to_earnings":None,"history":[],
             "beats":0,"meets":0,"misses":0,"avg_surprise_pct":np.nan,"error":None}

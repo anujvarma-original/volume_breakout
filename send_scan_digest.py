@@ -172,11 +172,7 @@ def earnings_text(r: dict) -> list[str]:
     out=[]
     sq=num(r.get("Short Squeeze Potential"))
     if sq is not None:
-        sp=num(r.get("Short % Float")); dc=num(r.get("Days to Cover"))
-        s=f"  - Short squeeze potential: {sq:.0f}/100 ({r.get('Short Squeeze Level','N/A')})"
-        if sp is not None: s+=f" | short float {sp*100:.1f}%"
-        if dc is not None: s+=f" | {dc:.1f} days to cover"
-        out.append(s)
+        out.append(f"  - Short Squeeze Potential: {sq:.0f}/100")
     if r.get("Upcoming ER"):
         d=r.get("Days to ER")
         s=f"  - Earnings: {r['Upcoming ER']}"
