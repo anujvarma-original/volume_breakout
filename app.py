@@ -28,6 +28,7 @@ st.set_page_config(
 
 ALERT_STATE_FILE = Path(".breakout_alert_state.json")
 DAILY_SCAN_STATE_FILE = Path(".daily_breakout_scan_state.json")
+SIGNAL_HISTORY_FILE = Path(".breakout_signal_history.json")
 
 DEFAULT_TICKERS = "BTC-USD, ETH-USD, SPY, QQQ, NVDA, AAPL"
 
@@ -82,6 +83,188 @@ def save_alert_state(state: dict[str, str]) -> None:
     except OSError as exc:
         st.warning(f"Could not save alert history: {exc}")
 
+
+
+def load_signal_history() -> list[dict[str, Any]]:
+    """Load persisted WATCH/CONFIRMED signals used for forward validation."""
+    try:
+        if SIGNAL_HISTORY_FILE.exists():
+            data = json.loads(SIGNAL_HISTORY_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def save_signal_history(history: list[dict[str, Any]]) -> None:
+    try:
+        SIGNAL_HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    except OSError as exc:
+        st.warning(f"Could not save signal validation history: {exc}")
+
+
+def record_new_signals(alerts: list[dict[str, Any]]) -> int:
+    """Persist new WATCH/CONFIRMED episodes without duplicating the same daily signal."""
+    history = load_signal_history()
+    existing = {x.get("Signal ID") for x in history}
+    added = 0
+    for r in alerts:
+        ticker = str(r.get("Ticker", ""))
+        signal_date = str(r.get("Latest Date", ""))
+        signal_type = str(r.get("State", ""))
+        level = safe_float(r.get("Breakout Level"))
+        if not ticker or not signal_date or signal_type not in {"BREAKOUT WATCH", "CONFIRMED BREAKOUT"}:
+            continue
+        # One observation per ticker/state/date. This preserves successive watch days for calibration.
+        signal_id = f"{ticker}|{signal_type}|{signal_date}"
+        if signal_id in existing:
+            continue
+        history.append({
+            "Signal ID": signal_id,
+            "Ticker": ticker,
+            "Signal Date": signal_date,
+            "Signal Type": signal_type,
+            "Signal Price": safe_float(r.get("Price")),
+            "Breakout Level": level,
+            "Box High": safe_float(r.get("Box High")),
+            "Overall Score": int(r.get("Strategy Score", 0)),
+            "Core Score": int(r.get("Core Score", r.get("Strategy Score", 0))),
+            "Short Squeeze Potential": safe_float(r.get("Short Squeeze Potential")),
+            "Volume Multiple": safe_float(r.get("Volume Multiple")),
+            "5-Day Probability %": safe_float(r.get("5-Day Probability %")),
+            "Status": "PENDING",
+        })
+        existing.add(signal_id)
+        added += 1
+    if added:
+        save_signal_history(history)
+    return added
+
+
+def review_mature_signals(market_data: dict[str, pd.DataFrame], sessions: int = 5) -> int:
+    """Grade signals after five subsequent trading sessions using close, MFE and MAE."""
+    history = load_signal_history()
+    changed = 0
+    for rec in history:
+        if rec.get("Status") == "REVIEWED":
+            continue
+        ticker = rec.get("Ticker")
+        raw = market_data.get(ticker)
+        if raw is None or raw.empty:
+            continue
+        try:
+            signal_date = pd.Timestamp(rec.get("Signal Date"))
+        except Exception:
+            continue
+        future = raw.loc[raw.index > signal_date].head(sessions)
+        if len(future) < sessions:
+            continue
+        p0 = safe_float(rec.get("Signal Price"))
+        if not np.isfinite(p0) or p0 <= 0:
+            continue
+        p5 = safe_float(future["Close"].iloc[-1])
+        max_high = safe_float(future["High"].max())
+        min_low = safe_float(future["Low"].min())
+        ret5 = (p5 / p0 - 1) * 100
+        mfe = (max_high / p0 - 1) * 100
+        mae = (min_low / p0 - 1) * 100
+        level = safe_float(rec.get("Breakout Level"))
+        held = bool(np.isfinite(level) and p5 >= level)
+
+        # Outcome emphasizes the actual 5-session close; MFE is retained separately
+        # so a strong tradable move is not lost when price later fades.
+        if ret5 >= 5:
+            outcome = "STRONG SUCCESS"
+        elif ret5 >= 2:
+            outcome = "SUCCESS"
+        elif ret5 <= -5:
+            outcome = "HARD FAILURE"
+        elif ret5 < -2:
+            outcome = "FAILED BREAKOUT"
+        else:
+            outcome = "FLAT / INCONCLUSIVE"
+        if rec.get("Signal Type") == "CONFIRMED BREAKOUT" and np.isfinite(level) and p5 < level and ret5 < 0:
+            outcome = "HARD FAILURE" if ret5 <= -5 else "FAILED BREAKOUT"
+
+        rec.update({
+            "Status": "REVIEWED",
+            "Review Date": future.index[-1].strftime("%Y-%m-%d"),
+            "Day 5 Price": p5,
+            "5-Day Return %": ret5,
+            "Max 5-Day Gain %": mfe,
+            "Max 5-Day Drawdown %": mae,
+            "Held Breakout": held,
+            "Outcome": outcome,
+        })
+        changed += 1
+    if changed:
+        save_signal_history(history)
+    return changed
+
+
+def overall_score_band(score: Any) -> str:
+    """Bucket the scanner's Overall Score into stable validation bands."""
+    value = safe_float(score)
+    if not np.isfinite(value):
+        return "Unknown"
+    if value >= 90:
+        return "90-100 (Exceptional)"
+    if value >= 80:
+        return "80-89 (Strong)"
+    if value >= 70:
+        return "70-79 (Good)"
+    if value >= 60:
+        return "60-69 (Moderate)"
+    return "<60 (Weak)"
+
+
+def signal_accuracy_frames() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return reviewed signals plus accuracy by signal type and Overall Score band."""
+    reviewed = [x for x in load_signal_history() if x.get("Status") == "REVIEWED"]
+    if not reviewed:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    detail = pd.DataFrame(reviewed)
+    detail["Successful"] = detail["Outcome"].isin(["SUCCESS", "STRONG SUCCESS"])
+    detail["Overall Score Numeric"] = pd.to_numeric(detail.get("Overall Score"), errors="coerce")
+    detail["Score Band"] = detail["Overall Score Numeric"].apply(overall_score_band)
+
+    type_groups = []
+    for signal_type, g in detail.groupby("Signal Type"):
+        type_groups.append({
+            "Signal Type": signal_type,
+            "Reviewed": len(g),
+            "Success Rate %": 100 * g["Successful"].mean(),
+            "Avg 5-Day Return %": pd.to_numeric(g["5-Day Return %"], errors="coerce").mean(),
+            "Avg Max Gain %": pd.to_numeric(g["Max 5-Day Gain %"], errors="coerce").mean(),
+            "Avg Max Drawdown %": pd.to_numeric(g["Max 5-Day Drawdown %"], errors="coerce").mean(),
+        })
+
+    band_order = [
+        "90-100 (Exceptional)",
+        "80-89 (Strong)",
+        "70-79 (Good)",
+        "60-69 (Moderate)",
+        "<60 (Weak)",
+        "Unknown",
+    ]
+    band_groups = []
+    for band in band_order:
+        g = detail.loc[detail["Score Band"] == band]
+        if g.empty:
+            continue
+        band_groups.append({
+            "Overall Score Band": band,
+            "Reviewed": len(g),
+            "Success Rate %": 100 * g["Successful"].mean(),
+            "Avg Overall Score": g["Overall Score Numeric"].mean(),
+            "Avg 5-Day Return %": pd.to_numeric(g["5-Day Return %"], errors="coerce").mean(),
+            "Avg Max Gain %": pd.to_numeric(g["Max 5-Day Gain %"], errors="coerce").mean(),
+            "Avg Max Drawdown %": pd.to_numeric(g["Max 5-Day Drawdown %"], errors="coerce").mean(),
+            "Breakout Hold Rate %": 100 * g["Held Breakout"].astype(bool).mean() if "Held Breakout" in g else np.nan,
+        })
+
+    return detail, pd.DataFrame(type_groups), pd.DataFrame(band_groups)
 
 def get_email_config() -> dict[str, Any]:
     """Read SMTP settings from Streamlit secrets or environment variables."""
@@ -1292,6 +1475,10 @@ def run_daily_market_scan(
         r["Squeeze Bonus"] = bonus
         r["Strategy Score"] = min(100, core + bonus)
 
+    # First grade older signals with today's downloaded candles, then store today's signals.
+    reviewed_now = review_mature_signals(market_data, sessions=5)
+    signals_added = record_new_signals(alerts)
+
     email_sent = False
     email_error = ""
     config = get_email_config()
@@ -1326,6 +1513,8 @@ def run_daily_market_scan(
         "errors": errors,
         "email_sent": email_sent,
         "email_error": email_error,
+        "signals_added": signals_added,
+        "signals_reviewed": reviewed_now,
     }
 
 
@@ -1603,6 +1792,48 @@ def main() -> None:
                 st.dataframe(alert_df, hide_index=True, use_container_width=True)
         except Exception as exc:
             st.error(f"Daily scan failed: {exc}")
+
+    st.subheader("5-Day Signal Accuracy")
+    accuracy_detail, accuracy_summary, score_band_summary = signal_accuracy_frames()
+    pending_count = sum(1 for x in load_signal_history() if x.get("Status") == "PENDING")
+    if accuracy_detail.empty:
+        st.info(f"No signals have completed the 5-session review yet. Pending signals: {pending_count}.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        success_rate = 100 * accuracy_detail["Successful"].mean()
+        c1.metric("Reviewed Signals", len(accuracy_detail))
+        c2.metric("Overall Success Rate", f"{success_rate:.1f}%")
+        c3.metric("Pending 5-Day Reviews", pending_count)
+        st.caption("Accuracy by signal type")
+        st.dataframe(
+            accuracy_summary.style.format({
+                "Success Rate %": "{:.1f}%",
+                "Avg 5-Day Return %": "{:+.2f}%",
+                "Avg Max Gain %": "{:+.2f}%",
+                "Avg Max Drawdown %": "{:+.2f}%",
+            }), hide_index=True, use_container_width=True
+        )
+
+        st.markdown("#### Accuracy by Overall Score Band")
+        st.caption("This tests whether higher Overall Scores actually produce better 5-day outcomes.")
+        st.dataframe(
+            score_band_summary.style.format({
+                "Success Rate %": "{:.1f}%",
+                "Avg Overall Score": "{:.1f}",
+                "Avg 5-Day Return %": "{:+.2f}%",
+                "Avg Max Gain %": "{:+.2f}%",
+                "Avg Max Drawdown %": "{:+.2f}%",
+                "Breakout Hold Rate %": "{:.1f}%",
+            }), hide_index=True, use_container_width=True
+        )
+
+        with st.expander("Reviewed signal history"):
+            cols = [c for c in [
+                "Ticker", "Signal Date", "Signal Type", "Signal Price", "Overall Score", "Score Band",
+                "Review Date", "Day 5 Price", "5-Day Return %", "Max 5-Day Gain %",
+                "Max 5-Day Drawdown %", "Held Breakout", "Outcome"
+            ] if c in accuracy_detail.columns]
+            st.dataframe(accuracy_detail[cols].sort_values("Signal Date", ascending=False), hide_index=True, use_container_width=True)
 
     try:
         with st.spinner(f"Loading {asset_name} ({ticker}) daily candles..."):
