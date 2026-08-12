@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# BUILD: DAILY S&P 500 + CRYPTO BREAKOUT SCANNER V3
+# BUILD: DAILY NASDAQ-100 + CRYPTO BREAKOUT SCANNER V3
 
 from dataclasses import dataclass
 from typing import Any
@@ -26,9 +26,9 @@ st.set_page_config(
 )
 
 
-ALERT_STATE_FILE = Path(".breakout_alert_state.json")
-DAILY_SCAN_STATE_FILE = Path(".daily_breakout_scan_state.json")
-SIGNAL_HISTORY_FILE = Path(".breakout_signal_history.json")
+ALERT_STATE_FILE = Path(".nasdaq100_breakout_alert_state.json")
+DAILY_SCAN_STATE_FILE = Path(".nasdaq100_daily_breakout_scan_state.json")
+SIGNAL_HISTORY_FILE = Path(".nasdaq100_breakout_signal_history.json")
 
 DEFAULT_TICKERS = "BTC-USD, ETH-USD, SPY, QQQ, NVDA, AAPL"
 
@@ -1138,35 +1138,26 @@ def save_daily_scan_state(state: dict[str, Any]) -> None:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_sp500_tickers() -> list[str]:
-    """Return current S&P 500 Yahoo Finance symbols with two public-source fallbacks."""
-    urls = [
-        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
-    ]
-    for url in urls:
-        try:
-            table = pd.read_csv(url)
-            symbol_col = next((c for c in table.columns if str(c).lower() in {"symbol", "ticker"}), None)
-            if symbol_col:
-                symbols = [str(s).strip().upper().replace(".", "-") for s in table[symbol_col].dropna()]
-                symbols = list(dict.fromkeys(s for s in symbols if s))
-                if len(symbols) >= 450:
-                    return symbols
-        except Exception:
-            pass
-
+def get_nasdaq100_tickers() -> list[str]:
+    """Return current Nasdaq-100 Yahoo Finance symbols from the public Wikipedia constituent table."""
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
         for table in tables:
-            symbol_col = next((c for c in table.columns if str(c).lower() in {"symbol", "ticker symbol"}), None)
+            symbol_col = next(
+                (c for c in table.columns if str(c).strip().lower() in {"ticker", "ticker symbol", "symbol"}),
+                None,
+            )
             if symbol_col:
-                symbols = [str(s).strip().upper().replace(".", "-") for s in table[symbol_col].dropna()]
-                symbols = list(dict.fromkeys(s for s in symbols if s))
-                if len(symbols) >= 450:
+                symbols = [str(x).strip().upper().replace(".", "-") for x in table[symbol_col].dropna()]
+                symbols = list(dict.fromkeys(x for x in symbols if x and x != "NAN"))
+                # Nasdaq-100 can contain more than 100 securities because a company may have multiple share classes.
+                if 95 <= len(symbols) <= 110:
                     return symbols
-    except Exception:
-        pass
-    raise RuntimeError("Could not load the S&P 500 constituent list from either source.")
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not load the Nasdaq-100 constituent list. Ensure pandas HTML dependencies (lxml) are installed."
+        ) from exc
+    raise RuntimeError("Could not locate a valid Nasdaq-100 constituent table.")
 
 
 def normalize_download_frame(data: pd.DataFrame) -> pd.DataFrame:
@@ -1187,7 +1178,7 @@ def normalize_download_frame(data: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_market_data_batch(tickers: tuple[str, ...], period: str, chunk_size: int = 50) -> dict[str, pd.DataFrame]:
-    """Download many symbols in chunks so a 500-stock daily scan is practical."""
+    """Download many symbols in chunks so a Nasdaq-100 daily scan is practical."""
     results: dict[str, pd.DataFrame] = {}
     symbols = list(tickers)
     for start in range(0, len(symbols), chunk_size):
@@ -1238,7 +1229,7 @@ def evaluate_relative_strength_vs_benchmark(
     benchmark_ticker: str,
     benchmark_df: pd.DataFrame,
 ) -> dict[str, Any]:
-    """Minervini-style relative-strength trend versus SPY for stocks, BTC for ETH."""
+    """Minervini-style relative-strength trend versus QQQ for Nasdaq-100 stocks, BTC for ETH."""
     if asset_ticker == benchmark_ticker:
         returns = {
             "30-day return positive": safe_float(asset_df["Return_30D_Pct"].iloc[-1]) > 0,
@@ -1298,7 +1289,7 @@ def analyze_daily_symbol(
     ticker: str,
     raw_df: pd.DataFrame,
     settings: Settings,
-    spy_df: pd.DataFrame,
+    qqq_df: pd.DataFrame,
     btc_df: pd.DataFrame,
 ) -> dict[str, Any]:
     asset_df = add_indicators(raw_df, settings)
@@ -1314,7 +1305,7 @@ def analyze_daily_symbol(
     elif ticker == "ETH-USD":
         rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "BTC-USD", btc_df)
     else:
-        rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "SPY", spy_df)
+        rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "QQQ", qqq_df)
     score = calculate_score(box, trend, dry, rs)
     state = box.get("state", "NO VALID BOX")
     latest_close = safe_float(asset_df["Close"].iloc[-1])
@@ -1354,7 +1345,7 @@ def send_daily_scan_email(config: dict[str, Any], scan_date: str, alerts: list[d
     watches = [r for r in alerts if r.get("State") == "BREAKOUT WATCH"]
     subject = f"Daily breakout scan: {len(confirmed)} confirmed / {len(watches)} watch — {scan_date}"
     lines = [
-        f"Darvas + Minervini Daily S&P 500 + Crypto Scan — {scan_date}",
+        f"Darvas + Minervini Daily Nasdaq-100 + Crypto Scan — {scan_date}",
         "",
         f"Confirmed breakouts: {len(confirmed)}",
         f"Breakout watches: {len(watches)}",
@@ -1417,7 +1408,7 @@ def run_daily_market_scan(
     force: bool = False,
     progress_callback=None,
 ) -> dict[str, Any]:
-    """Scan the full S&P 500 plus BTC/ETH and optionally email WATCH/CONFIRMED results."""
+    """Scan the full Nasdaq-100 plus BTC/ETH and optionally email WATCH/CONFIRMED results."""
     settings = settings or default_daily_settings()
     scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_state = load_daily_scan_state()
@@ -1429,14 +1420,14 @@ def run_daily_market_scan(
             "alerts": daily_state.get("last_alerts", []),
         }
 
-    sp500 = get_sp500_tickers()
-    scan_universe = list(dict.fromkeys(sp500 + ["BTC-USD", "ETH-USD"]))
-    download_symbols = list(dict.fromkeys(scan_universe + ["SPY"]))
+    nasdaq100 = get_nasdaq100_tickers()
+    scan_universe = list(dict.fromkeys(nasdaq100 + ["BTC-USD", "ETH-USD"]))
+    download_symbols = list(dict.fromkeys(scan_universe + ["QQQ"]))
 
     market_data = download_market_data_batch(tuple(download_symbols), settings.history_period, chunk_size=50)
-    if "SPY" not in market_data or "BTC-USD" not in market_data:
-        raise RuntimeError("Benchmark data for SPY and/or BTC-USD could not be downloaded.")
-    spy_df = add_indicators(market_data["SPY"], settings)
+    if "QQQ" not in market_data or "BTC-USD" not in market_data:
+        raise RuntimeError("Benchmark data for QQQ and/or BTC-USD could not be downloaded.")
+    qqq_df = add_indicators(market_data["QQQ"], settings)
     btc_df = add_indicators(market_data["BTC-USD"], settings)
 
     results: list[dict[str, Any]] = []
@@ -1449,7 +1440,7 @@ def run_daily_market_scan(
             errors.append({"Ticker": ticker, "Error": "No market data"})
             continue
         try:
-            result = analyze_daily_symbol(ticker, raw, settings, spy_df, btc_df)
+            result = analyze_daily_symbol(ticker, raw, settings, qqq_df, btc_df)
             if result.get("Error"):
                 errors.append({"Ticker": ticker, "Error": result["Error"]})
             else:
@@ -1460,7 +1451,7 @@ def run_daily_market_scan(
     alerts = [r for r in results if r.get("State") in {"BREAKOUT WATCH", "CONFIRMED BREAKOUT"}]
 
     # Fetch slower short-interest fundamentals only for actionable candidates. This
-    # keeps the full S&P scan practical and ensures low-short-interest breakouts
+    # keeps the full Nasdaq-100 scan practical and ensures low-short-interest breakouts
     # are never filtered out before the squeeze bonus is considered.
     for r in alerts:
         ticker = r.get("Ticker", "")
@@ -1656,7 +1647,7 @@ def render_earnings_snapshot(ticker: str) -> None:
 
 def main() -> None:
     st.title("📦 Darvas + Minervini Volume Breakout Scanner")
-    st.caption("Build: Daily S&P 500 + Crypto Breakout Scanner V3")
+    st.caption("Build: Daily Nasdaq-100 + Crypto Breakout Scanner V3")
     st.caption(
         "Scan crypto, stocks and ETFs with the same Darvas-box, Minervini trend, "
         "volume-contraction and breakout logic."
@@ -1745,9 +1736,9 @@ def main() -> None:
         chart_days=chart_days,
     )
 
-    st.subheader("Daily S&P 500 + Crypto Scan")
+    st.subheader("Daily Nasdaq-100 + Crypto Scan")
     st.caption(
-        "The batch engine scans every current S&P 500 constituent plus BTC-USD and ETH-USD. "
+        "The batch engine scans every current Nasdaq-100 constituent plus BTC-USD and ETH-USD. "
         "It emails one digest containing only BREAKOUT WATCH and CONFIRMED BREAKOUT signals."
     )
     daily_left, daily_right = st.columns([1, 3])
