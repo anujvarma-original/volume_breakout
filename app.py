@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# BUILD: DAILY NASDAQ-100 + CRYPTO BREAKOUT SCANNER V3
+# BUILD: DAILY S&P 500 + CRYPTO BREAKOUT SCANNER V3
 
 from dataclasses import dataclass
 from typing import Any
@@ -26,9 +26,43 @@ st.set_page_config(
 )
 
 
-ALERT_STATE_FILE = Path(".nasdaq100_breakout_alert_state.json")
-DAILY_SCAN_STATE_FILE = Path(".nasdaq100_daily_breakout_scan_state.json")
-SIGNAL_HISTORY_FILE = Path(".nasdaq100_breakout_signal_history.json")
+ALERT_STATE_FILE = Path(".breakout_alert_state.json")
+
+# The same Streamlit deployment can be driven by URL query parameters:
+#   ?scan=sp500
+#   ?scan=nasdaq100
+# Add &autorun=1 when an actual Streamlit browser session should start the
+# selected daily scan automatically. Daily state/history are kept separate.
+def _query_value(name: str, default: str = "") -> str:
+    try:
+        value = st.query_params.get(name, default)
+        if isinstance(value, list):
+            value = value[-1] if value else default
+        return str(value or default).strip()
+    except Exception:
+        return default
+
+
+def normalize_scan_mode(value: str) -> str:
+    value = str(value or "").strip().lower().replace("-", "").replace("_", "")
+    return "nasdaq100" if value in {"nasdaq", "nasdaq100", "ndx", "qqq"} else "sp500"
+
+
+ACTIVE_SCAN_MODE = normalize_scan_mode(_query_value("scan", "sp500"))
+ACTIVE_SCAN_LABEL = "NASDAQ-100" if ACTIVE_SCAN_MODE == "nasdaq100" else "S&P 500"
+ACTIVE_BENCHMARK = "QQQ" if ACTIVE_SCAN_MODE == "nasdaq100" else "SPY"
+AUTO_RUN_DAILY_SCAN = _query_value("autorun", "0").lower() in {"1", "true", "yes", "on"}
+
+DAILY_SCAN_STATE_FILE = Path(
+    ".nasdaq100_daily_breakout_scan_state.json"
+    if ACTIVE_SCAN_MODE == "nasdaq100"
+    else ".sp500_daily_breakout_scan_state.json"
+)
+SIGNAL_HISTORY_FILE = Path(
+    ".nasdaq100_breakout_signal_history.json"
+    if ACTIVE_SCAN_MODE == "nasdaq100"
+    else ".sp500_breakout_signal_history.json"
+)
 
 DEFAULT_TICKERS = "BTC-USD, ETH-USD, SPY, QQQ, NVDA, AAPL"
 
@@ -1138,26 +1172,94 @@ def save_daily_scan_state(state: dict[str, Any]) -> None:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_nasdaq100_tickers() -> list[str]:
-    """Return current Nasdaq-100 Yahoo Finance symbols from the public Wikipedia constituent table."""
+def get_sp500_tickers() -> list[str]:
+    """Return current S&P 500 Yahoo Finance symbols with two public-source fallbacks."""
+    urls = [
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+    ]
+    for url in urls:
+        try:
+            table = pd.read_csv(url)
+            symbol_col = next((c for c in table.columns if str(c).lower() in {"symbol", "ticker"}), None)
+            if symbol_col:
+                symbols = [str(s).strip().upper().replace(".", "-") for s in table[symbol_col].dropna()]
+                symbols = list(dict.fromkeys(s for s in symbols if s))
+                if len(symbols) >= 450:
+                    return symbols
+        except Exception:
+            pass
+
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         for table in tables:
+            symbol_col = next((c for c in table.columns if str(c).lower() in {"symbol", "ticker symbol"}), None)
+            if symbol_col:
+                symbols = [str(s).strip().upper().replace(".", "-") for s in table[symbol_col].dropna()]
+                symbols = list(dict.fromkeys(s for s in symbols if s))
+                if len(symbols) >= 450:
+                    return symbols
+    except Exception:
+        pass
+    raise RuntimeError("Could not load the S&P 500 constituent list from either source.")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_nasdaq100_tickers() -> list[str]:
+    """Return current Nasdaq-100 Yahoo Finance symbols.
+
+    The loader intentionally tries multiple public pages because index membership
+    changes over time and any one source can occasionally be unavailable.
+    """
+    # CSV first: this avoids an lxml dependency on Streamlit deployments.
+    csv_urls = [
+        "https://raw.githubusercontent.com/Gary-Strauss/NASDAQ100_Constituents/master/data/nasdaq100_constituents.csv",
+    ]
+    for url in csv_urls:
+        try:
+            table = pd.read_csv(url)
             symbol_col = next(
-                (c for c in table.columns if str(c).strip().lower() in {"ticker", "ticker symbol", "symbol"}),
+                (c for c in table.columns if str(c).strip().lower() in {"symbol", "ticker", "ticker symbol"}),
                 None,
             )
-            if symbol_col:
-                symbols = [str(x).strip().upper().replace(".", "-") for x in table[symbol_col].dropna()]
-                symbols = list(dict.fromkeys(x for x in symbols if x and x != "NAN"))
-                # Nasdaq-100 can contain more than 100 securities because a company may have multiple share classes.
-                if 95 <= len(symbols) <= 110:
+            if symbol_col is not None:
+                symbols = [str(s).strip().upper().replace(".", "-") for s in table[symbol_col].dropna()]
+                symbols = list(dict.fromkeys(s for s in symbols if s and len(s) <= 8))
+                if len(symbols) >= 90:
                     return symbols
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not load the Nasdaq-100 constituent list. Ensure pandas HTML dependencies (lxml) are installed."
-        ) from exc
-    raise RuntimeError("Could not locate a valid Nasdaq-100 constituent table.")
+        except Exception:
+            pass
+
+    # HTML fallbacks if the CSV source is temporarily unavailable.
+    urls = [
+        "https://www.nasdaq.com/solutions/global-indexes/nasdaq-100/companies",
+        "https://en.wikipedia.org/wiki/Nasdaq-100",
+    ]
+    for url in urls:
+        try:
+            tables = pd.read_html(url)
+            for table in tables:
+                symbol_col = next(
+                    (c for c in table.columns if str(c).strip().lower() in {"symbol", "ticker", "ticker symbol"}),
+                    None,
+                )
+                if symbol_col is None:
+                    continue
+                symbols = [str(s).strip().upper().replace(".", "-") for s in table[symbol_col].dropna()]
+                symbols = list(dict.fromkeys(s for s in symbols if s and len(s) <= 8))
+                # The index has 100 companies and can have more than 100 securities
+                # because multiple share classes may be included.
+                if len(symbols) >= 90:
+                    return symbols
+        except Exception:
+            pass
+    raise RuntimeError("Could not load the Nasdaq-100 constituent list from either source.")
+
+
+def get_scan_universe(scan_mode: str) -> tuple[list[str], str, str]:
+    mode = normalize_scan_mode(scan_mode)
+    if mode == "nasdaq100":
+        return get_nasdaq100_tickers(), "QQQ", "NASDAQ-100"
+    return get_sp500_tickers(), "SPY", "S&P 500"
 
 
 def normalize_download_frame(data: pd.DataFrame) -> pd.DataFrame:
@@ -1178,7 +1280,7 @@ def normalize_download_frame(data: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_market_data_batch(tickers: tuple[str, ...], period: str, chunk_size: int = 50) -> dict[str, pd.DataFrame]:
-    """Download many symbols in chunks so a Nasdaq-100 daily scan is practical."""
+    """Download many symbols in chunks so a 500-stock daily scan is practical."""
     results: dict[str, pd.DataFrame] = {}
     symbols = list(tickers)
     for start in range(0, len(symbols), chunk_size):
@@ -1229,7 +1331,7 @@ def evaluate_relative_strength_vs_benchmark(
     benchmark_ticker: str,
     benchmark_df: pd.DataFrame,
 ) -> dict[str, Any]:
-    """Minervini-style relative-strength trend versus QQQ for Nasdaq-100 stocks, BTC for ETH."""
+    """Minervini-style relative-strength trend versus SPY for stocks, BTC for ETH."""
     if asset_ticker == benchmark_ticker:
         returns = {
             "30-day return positive": safe_float(asset_df["Return_30D_Pct"].iloc[-1]) > 0,
@@ -1289,8 +1391,9 @@ def analyze_daily_symbol(
     ticker: str,
     raw_df: pd.DataFrame,
     settings: Settings,
-    qqq_df: pd.DataFrame,
+    stock_benchmark_df: pd.DataFrame,
     btc_df: pd.DataFrame,
+    stock_benchmark_ticker: str = "SPY",
 ) -> dict[str, Any]:
     asset_df = add_indicators(raw_df, settings)
     minimum_rows = max(221, settings.max_base_days + 2)
@@ -1305,7 +1408,7 @@ def analyze_daily_symbol(
     elif ticker == "ETH-USD":
         rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "BTC-USD", btc_df)
     else:
-        rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "QQQ", qqq_df)
+        rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, stock_benchmark_ticker, stock_benchmark_df)
     score = calculate_score(box, trend, dry, rs)
     state = box.get("state", "NO VALID BOX")
     latest_close = safe_float(asset_df["Close"].iloc[-1])
@@ -1340,12 +1443,17 @@ def analyze_daily_symbol(
     }
 
 
-def send_daily_scan_email(config: dict[str, Any], scan_date: str, alerts: list[dict[str, Any]]) -> None:
+def send_daily_scan_email(
+    config: dict[str, Any],
+    scan_date: str,
+    alerts: list[dict[str, Any]],
+    universe_label: str,
+) -> None:
     confirmed = [r for r in alerts if r.get("State") == "CONFIRMED BREAKOUT"]
     watches = [r for r in alerts if r.get("State") == "BREAKOUT WATCH"]
-    subject = f"Daily breakout scan: {len(confirmed)} confirmed / {len(watches)} watch — {scan_date}"
+    subject = f"[{universe_label}] Daily breakout scan: {len(confirmed)} confirmed / {len(watches)} watch — {scan_date}"
     lines = [
-        f"Darvas + Minervini Daily Nasdaq-100 + Crypto Scan — {scan_date}",
+        f"Darvas + Minervini Daily {universe_label} + Crypto Scan — {scan_date}",
         "",
         f"Confirmed breakouts: {len(confirmed)}",
         f"Breakout watches: {len(watches)}",
@@ -1407,9 +1515,12 @@ def run_daily_market_scan(
     send_email: bool = True,
     force: bool = False,
     progress_callback=None,
+    scan_mode: str | None = None,
 ) -> dict[str, Any]:
-    """Scan the full Nasdaq-100 plus BTC/ETH and optionally email WATCH/CONFIRMED results."""
+    """Scan the selected stock universe plus BTC/ETH and email WATCH/CONFIRMED results."""
     settings = settings or default_daily_settings()
+    scan_mode = normalize_scan_mode(scan_mode or ACTIVE_SCAN_MODE)
+    stock_symbols, stock_benchmark_ticker, universe_label = get_scan_universe(scan_mode)
     scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_state = load_daily_scan_state()
     if not force and daily_state.get("last_completed_scan_utc") == scan_date:
@@ -1420,14 +1531,15 @@ def run_daily_market_scan(
             "alerts": daily_state.get("last_alerts", []),
         }
 
-    nasdaq100 = get_nasdaq100_tickers()
-    scan_universe = list(dict.fromkeys(nasdaq100 + ["BTC-USD", "ETH-USD"]))
-    download_symbols = list(dict.fromkeys(scan_universe + ["QQQ"]))
+    scan_universe = list(dict.fromkeys(stock_symbols + ["BTC-USD", "ETH-USD"]))
+    download_symbols = list(dict.fromkeys(scan_universe + [stock_benchmark_ticker]))
 
     market_data = download_market_data_batch(tuple(download_symbols), settings.history_period, chunk_size=50)
-    if "QQQ" not in market_data or "BTC-USD" not in market_data:
-        raise RuntimeError("Benchmark data for QQQ and/or BTC-USD could not be downloaded.")
-    qqq_df = add_indicators(market_data["QQQ"], settings)
+    if stock_benchmark_ticker not in market_data or "BTC-USD" not in market_data:
+        raise RuntimeError(
+            f"Benchmark data for {stock_benchmark_ticker} and/or BTC-USD could not be downloaded."
+        )
+    stock_benchmark_df = add_indicators(market_data[stock_benchmark_ticker], settings)
     btc_df = add_indicators(market_data["BTC-USD"], settings)
 
     results: list[dict[str, Any]] = []
@@ -1440,7 +1552,9 @@ def run_daily_market_scan(
             errors.append({"Ticker": ticker, "Error": "No market data"})
             continue
         try:
-            result = analyze_daily_symbol(ticker, raw, settings, qqq_df, btc_df)
+            result = analyze_daily_symbol(
+                ticker, raw, settings, stock_benchmark_df, btc_df, stock_benchmark_ticker
+            )
             if result.get("Error"):
                 errors.append({"Ticker": ticker, "Error": result["Error"]})
             else:
@@ -1451,7 +1565,7 @@ def run_daily_market_scan(
     alerts = [r for r in results if r.get("State") in {"BREAKOUT WATCH", "CONFIRMED BREAKOUT"}]
 
     # Fetch slower short-interest fundamentals only for actionable candidates. This
-    # keeps the full Nasdaq-100 scan practical and ensures low-short-interest breakouts
+    # keeps the full S&P scan practical and ensures low-short-interest breakouts
     # are never filtered out before the squeeze bonus is considered.
     for r in alerts:
         ticker = r.get("Ticker", "")
@@ -1476,7 +1590,7 @@ def run_daily_market_scan(
     if send_email and alerts:
         if email_configured(config):
             try:
-                send_daily_scan_email(config, scan_date, alerts)
+                send_daily_scan_email(config, scan_date, alerts, universe_label)
                 email_sent = True
             except Exception as exc:
                 email_error = str(exc)
@@ -1496,6 +1610,9 @@ def run_daily_market_scan(
     return {
         "skipped": False,
         "scan_date": scan_date,
+        "scan_mode": scan_mode,
+        "universe_label": universe_label,
+        "benchmark": stock_benchmark_ticker,
         "universe_count": len(scan_universe),
         "analyzed_count": len(results),
         "error_count": len(errors),
@@ -1647,7 +1764,7 @@ def render_earnings_snapshot(ticker: str) -> None:
 
 def main() -> None:
     st.title("📦 Darvas + Minervini Volume Breakout Scanner")
-    st.caption("Build: Daily Nasdaq-100 + Crypto Breakout Scanner V3")
+    st.caption(f"Build: Daily {ACTIVE_SCAN_LABEL} + Crypto Breakout Scanner V4")
     st.caption(
         "Scan crypto, stocks and ETFs with the same Darvas-box, Minervini trend, "
         "volume-contraction and breakout logic."
@@ -1736,26 +1853,42 @@ def main() -> None:
         chart_days=chart_days,
     )
 
-    st.subheader("Daily Nasdaq-100 + Crypto Scan")
+    st.subheader(f"Daily {ACTIVE_SCAN_LABEL} + Crypto Scan")
     st.caption(
-        "The batch engine scans every current Nasdaq-100 constituent plus BTC-USD and ETH-USD. "
-        "It emails one digest containing only BREAKOUT WATCH and CONFIRMED BREAKOUT signals."
+        f"URL-selected universe: {ACTIVE_SCAN_LABEL}. Stocks use {ACTIVE_BENCHMARK} for relative strength; "
+        "BTC-USD and ETH-USD are also scanned. The digest includes only BREAKOUT WATCH and "
+        "CONFIRMED BREAKOUT signals."
+    )
+    st.code(
+        f"?scan={ACTIVE_SCAN_MODE}" + ("&autorun=1" if AUTO_RUN_DAILY_SCAN else ""),
+        language=None,
     )
     daily_left, daily_right = st.columns([1, 3])
     with daily_left:
-        run_daily_now = st.button("Run full daily scan now", type="primary", use_container_width=True)
+        run_daily_now = st.button(
+            f"Run full {ACTIVE_SCAN_LABEL} scan now", type="primary", use_container_width=True
+        )
     with daily_right:
         st.caption("For unattended once-daily execution, use the included GitHub Actions workflow / daily_scan.py runner.")
 
-    if run_daily_now:
-        progress = st.progress(0.0, text="Starting daily market scan...")
+    # autorun=1 is useful for an automation/browser session. The normal daily-state
+    # guard prevents repeated emails on Streamlit reruns unless the manual button is used.
+    should_run_daily = run_daily_now or AUTO_RUN_DAILY_SCAN
+    if should_run_daily:
+        progress = st.progress(0.0, text=f"Starting {ACTIVE_SCAN_LABEL} daily market scan...")
         def _update_progress(done: int, total: int, symbol: str) -> None:
             progress.progress(min(done / max(total, 1), 1.0), text=f"Scanning {symbol} ({done}/{total})")
         try:
             daily_result = run_daily_market_scan(
-                settings=settings, send_email=True, force=True, progress_callback=_update_progress
+                settings=settings,
+                send_email=True,
+                force=bool(run_daily_now),
+                progress_callback=_update_progress,
+                scan_mode=ACTIVE_SCAN_MODE,
             )
             progress.progress(1.0, text="Daily scan complete")
+            if daily_result.get("skipped"):
+                st.info(f"{ACTIVE_SCAN_LABEL} scan already completed for {daily_result.get('scan_date')}; no duplicate email sent.")
             alerts = daily_result.get("alerts", [])
             confirmed = sum(1 for r in alerts if r.get("State") == "CONFIRMED BREAKOUT")
             watches = sum(1 for r in alerts if r.get("State") == "BREAKOUT WATCH")
@@ -2287,7 +2420,7 @@ recipient = "destination@example.com"
 use_ssl = true
 ```
 
-For Gmail, use an **App Password**, not your normal account password. The displayed-ticker alert sends once for each unique ticker/candle/breakout level. The daily batch scanner sends one digest containing all BREAKOUT WATCH and CONFIRMED BREAKOUT states. For dependable unattended daily execution, run daily_scan.py from the included GitHub Actions workflow.
+For Gmail, use an **App Password**, not your normal account password. The displayed-ticker alert sends once for each unique ticker/candle/breakout level. The daily batch scanner sends one universe-labeled digest containing all BREAKOUT WATCH and CONFIRMED BREAKOUT states. For dependable unattended daily execution, run daily_scan.py from the included GitHub Actions workflow.
             """
         )
 
