@@ -17,4 +17,4 @@ jobs:
             --silent \
             --show-error \
             --output /dev/null \
-            "https://YOUR-APP.streamlit.app/?scan=nasdaq100&autorun=1"
+            "https://volbreakout.streamlit.app/?scan=nasdaq100&autorun=1"
