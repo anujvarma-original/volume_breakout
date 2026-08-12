@@ -1,0 +1,20 @@
+name: Daily Nasdaq-100 Breakout Scan
+
+on:
+  schedule:
+    - cron: "40 13 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  wake-nasdaq100-scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run Nasdaq-100 scan
+        run: |
+          curl -L \
+            --max-time 120 \
+            --silent \
+            --show-error \
+            --output /dev/null \
+            "https://YOUR-APP.streamlit.app/?scan=nasdaq100&autorun=1"

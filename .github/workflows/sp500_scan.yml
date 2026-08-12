@@ -1,0 +1,20 @@
+name: Daily S&P 500 Breakout Scan
+
+on:
+  schedule:
+    - cron: "30 13 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  wake-sp500-scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run S&P 500 scan
+        run: |
+          curl -L \
+            --max-time 120 \
+            --silent \
+            --show-error \
+            --output /dev/null \
+            "https://YOUR-APP.streamlit.app/?scan=sp500&autorun=1"
