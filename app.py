@@ -166,6 +166,7 @@ def record_new_signals(alerts: list[dict[str, Any]]) -> int:
             "Short Squeeze Potential": safe_float(r.get("Short Squeeze Potential")),
             "Volume Multiple": safe_float(r.get("Volume Multiple")),
             "5-Day Probability %": safe_float(r.get("5-Day Probability %")),
+            "Pre-Breakout Score": safe_float(r.get("Pre-Breakout Score")),
             "Status": "PENDING",
         })
         existing.add(signal_id)
@@ -299,6 +300,52 @@ def signal_accuracy_frames() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         })
 
     return detail, pd.DataFrame(type_groups), pd.DataFrame(band_groups)
+
+
+def pre_breakout_accuracy_frame() -> pd.DataFrame:
+    """Summarize reviewed 5-day outcomes by the new 0-10 Pre-Breakout score."""
+    reviewed = [x for x in load_signal_history() if x.get("Status") == "REVIEWED"]
+    if not reviewed:
+        return pd.DataFrame()
+
+    detail = pd.DataFrame(reviewed)
+    if "Pre-Breakout Score" not in detail.columns:
+        return pd.DataFrame()
+
+    detail["Pre-Breakout Numeric"] = pd.to_numeric(detail["Pre-Breakout Score"], errors="coerce")
+    detail = detail.dropna(subset=["Pre-Breakout Numeric"])
+    if detail.empty:
+        return pd.DataFrame()
+
+    detail["Successful"] = detail["Outcome"].isin(["SUCCESS", "STRONG SUCCESS"])
+
+    def band(v: float) -> str:
+        if v >= 9:
+            return "9-10 (Very High)"
+        if v >= 7:
+            return "7-8 (High)"
+        if v >= 5:
+            return "5-6 (Moderate)"
+        return "0-4 (Low)"
+
+    detail["Pre-Breakout Band"] = detail["Pre-Breakout Numeric"].apply(band)
+    order = ["9-10 (Very High)", "7-8 (High)", "5-6 (Moderate)", "0-4 (Low)"]
+    rows = []
+    for b in order:
+        g = detail.loc[detail["Pre-Breakout Band"] == b]
+        if g.empty:
+            continue
+        rows.append({
+            "Pre-Breakout Band": b,
+            "Reviewed": len(g),
+            "Success Rate %": 100 * g["Successful"].mean(),
+            "Avg 5-Day Return %": pd.to_numeric(g["5-Day Return %"], errors="coerce").mean(),
+            "Avg Max Gain %": pd.to_numeric(g["Max 5-Day Gain %"], errors="coerce").mean(),
+            "Avg Max Drawdown %": pd.to_numeric(g["Max 5-Day Drawdown %"], errors="coerce").mean(),
+        })
+    return pd.DataFrame(rows)
+
+
 
 def get_email_config() -> dict[str, Any]:
     """Read SMTP settings from Streamlit secrets or environment variables."""
@@ -486,6 +533,37 @@ def add_indicators(data: pd.DataFrame, settings: Settings) -> pd.DataFrame:
     df["Return_30D_Pct"] = df["Close"].pct_change(30) * 100
     df["Return_90D_Pct"] = df["Close"].pct_change(90) * 100
     df["Return_180D_Pct"] = df["Close"].pct_change(180) * 100
+
+    # --- Pre-breakout momentum indicators ---
+    # RSI(14), Wilder smoothing.
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI_14"] = 100 - (100 / (1 + rs))
+    df.loc[(avg_loss == 0) & (avg_gain > 0), "RSI_14"] = 100.0
+    df.loc[(avg_loss == 0) & (avg_gain == 0), "RSI_14"] = 50.0
+
+    # On-Balance Volume.
+    direction = np.sign(df["Close"].diff()).fillna(0.0)
+    df["OBV"] = (direction * df["Volume"]).cumsum()
+
+    # Bollinger Band Width(20, 2). Lower values indicate tighter compression.
+    bb_mid = df["Close"].rolling(20).mean()
+    bb_std = df["Close"].rolling(20).std(ddof=0)
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    df["BB_Width"] = ((bb_upper - bb_lower) / bb_mid.replace(0, np.nan)) * 100
+    df["BB_Width_Avg_20"] = df["BB_Width"].rolling(20).mean()
+
+    # Chaikin Money Flow(20): positive values indicate accumulation.
+    hl_range = (df["High"] - df["Low"]).replace(0, np.nan)
+    money_flow_multiplier = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / hl_range
+    money_flow_volume = money_flow_multiplier.fillna(0.0) * df["Volume"]
+    volume_sum_20 = df["Volume"].rolling(20).sum().replace(0, np.nan)
+    df["CMF_20"] = money_flow_volume.rolling(20).sum() / volume_sum_20
 
     return df
 
@@ -767,6 +845,137 @@ def evaluate_relative_strength(
     return {"label": f"{asset_ticker} relative strength vs BTC", "checks": checks,
             "passed": passed, "total": len(checks), "ratio_series": aligned,
             "latest_ratio": safe_float(latest[ratio_col]), "ratio_column": ratio_col}
+
+
+def evaluate_pre_breakout_momentum(
+    asset_df: pd.DataFrame,
+    benchmark_df: pd.DataFrame | None,
+    asset_ticker: str,
+    benchmark_ticker: str,
+) -> dict[str, Any]:
+    """Score leading/pre-breakout evidence on a separate 0-10 scale.
+
+    Components:
+      Relative-strength line leadership  0-3
+      OBV accumulation                   0-2
+      Bollinger-width compression        0-2
+      RSI momentum                       0-2
+      Chaikin money flow                 0-1
+
+    This score is intentionally NOT added to the existing Overall Score yet.
+    Keeping it separate lets the 5-day validation history determine whether it
+    adds predictive value before it changes the production ranking.
+    """
+    result: dict[str, Any] = {
+        "available": False,
+        "score": 0,
+        "max_score": 10,
+        "label": "N/A",
+        "components": {},
+        "checks": {},
+    }
+    if asset_df is None or asset_df.empty or len(asset_df) < 60:
+        return result
+
+    latest = asset_df.iloc[-1]
+    components: dict[str, int] = {}
+    checks: dict[str, bool] = {}
+
+    # 1) Relative-strength line leadership: 0-3.
+    rs_points = 0
+    if benchmark_df is not None and not benchmark_df.empty and asset_ticker != benchmark_ticker:
+        aligned = pd.concat(
+            [
+                asset_df["Close"].rename("Asset"),
+                benchmark_df["Close"].rename("Benchmark"),
+            ],
+            axis=1,
+            join="inner",
+        ).dropna()
+        if len(aligned) >= 60:
+            aligned["RS_Line"] = aligned["Asset"] / aligned["Benchmark"]
+            aligned["RS_SMA_50"] = aligned["RS_Line"].rolling(50).mean()
+            aligned["RS_High_90"] = aligned["RS_Line"].rolling(90, min_periods=60).max()
+            rs_latest = aligned.iloc[-1]
+            rs_10_ago = safe_float(aligned["RS_Line"].iloc[-11]) if len(aligned) >= 11 else np.nan
+            rs_now = safe_float(rs_latest["RS_Line"])
+            rs_sma50 = safe_float(rs_latest["RS_SMA_50"])
+            rs_high90 = safe_float(rs_latest["RS_High_90"])
+
+            c1 = np.isfinite(rs_now) and np.isfinite(rs_sma50) and rs_now > rs_sma50
+            c2 = np.isfinite(rs_now) and np.isfinite(rs_high90) and rs_high90 > 0 and rs_now >= rs_high90 * 0.99
+            c3 = np.isfinite(rs_now) and np.isfinite(rs_10_ago) and rs_now > rs_10_ago
+            checks["RS line above 50-day average"] = bool(c1)
+            checks["RS line at/near 90-day high"] = bool(c2)
+            checks["RS line rising over 10 sessions"] = bool(c3)
+            rs_points = int(c1) + int(c2) + int(c3)
+    elif asset_ticker == benchmark_ticker:
+        # For the benchmark itself, use price momentum as a neutral substitute.
+        close_now = safe_float(asset_df["Close"].iloc[-1])
+        close_10 = safe_float(asset_df["Close"].iloc[-11]) if len(asset_df) >= 11 else np.nan
+        sma50 = safe_float(asset_df["SMA_50"].iloc[-1])
+        high90 = safe_float(asset_df["Close"].rolling(90, min_periods=60).max().iloc[-1])
+        c1 = np.isfinite(close_now) and np.isfinite(sma50) and close_now > sma50
+        c2 = np.isfinite(close_now) and np.isfinite(high90) and high90 > 0 and close_now >= high90 * 0.99
+        c3 = np.isfinite(close_now) and np.isfinite(close_10) and close_now > close_10
+        checks["Price above 50-day average (benchmark proxy)"] = bool(c1)
+        checks["Price at/near 90-day high (benchmark proxy)"] = bool(c2)
+        checks["Price rising over 10 sessions (benchmark proxy)"] = bool(c3)
+        rs_points = int(c1) + int(c2) + int(c3)
+    components["Relative Strength"] = rs_points
+
+    # 2) OBV accumulation: 0-2.
+    obv_now = safe_float(latest.get("OBV"))
+    obv_high50 = safe_float(asset_df["OBV"].rolling(50, min_periods=30).max().iloc[-1])
+    obv_10 = safe_float(asset_df["OBV"].iloc[-11]) if len(asset_df) >= 11 else np.nan
+    obv_high = np.isfinite(obv_now) and np.isfinite(obv_high50) and obv_now >= obv_high50 * 0.995
+    obv_rising = np.isfinite(obv_now) and np.isfinite(obv_10) and obv_now > obv_10
+    checks["OBV at/near 50-day high"] = bool(obv_high)
+    checks["OBV rising over 10 sessions"] = bool(obv_rising)
+    components["OBV"] = int(obv_high) + int(obv_rising)
+
+    # 3) Bollinger Band Width compression: 0-2.
+    bbw_now = safe_float(latest.get("BB_Width"))
+    bbw_hist = asset_df["BB_Width"].dropna().tail(126)
+    bbw_p20 = safe_float(bbw_hist.quantile(0.20)) if len(bbw_hist) >= 40 else np.nan
+    bbw_avg20 = safe_float(latest.get("BB_Width_Avg_20"))
+    bbw_compressed = np.isfinite(bbw_now) and np.isfinite(bbw_p20) and bbw_now <= bbw_p20
+    bbw_contracting = np.isfinite(bbw_now) and np.isfinite(bbw_avg20) and bbw_now < bbw_avg20
+    checks["Bollinger width in lowest 20% of 6-month range"] = bool(bbw_compressed)
+    checks["Bollinger width below its 20-day average"] = bool(bbw_contracting)
+    components["Volatility Compression"] = int(bbw_compressed) + int(bbw_contracting)
+
+    # 4) RSI momentum: 0-2. Strong but not extremely extended.
+    rsi_now = safe_float(latest.get("RSI_14"))
+    rsi_5 = safe_float(asset_df["RSI_14"].iloc[-6]) if len(asset_df) >= 6 else np.nan
+    rsi_zone = np.isfinite(rsi_now) and 50 <= rsi_now <= 80
+    rsi_rising = np.isfinite(rsi_now) and np.isfinite(rsi_5) and rsi_now > rsi_5
+    checks["RSI in 50-80 momentum zone"] = bool(rsi_zone)
+    checks["RSI rising over 5 sessions"] = bool(rsi_rising)
+    components["RSI Momentum"] = int(rsi_zone) + int(rsi_rising)
+
+    # 5) Chaikin Money Flow: 0-1.
+    cmf_now = safe_float(latest.get("CMF_20"))
+    cmf_positive = np.isfinite(cmf_now) and cmf_now > 0.05
+    checks["CMF(20) above +0.05"] = bool(cmf_positive)
+    components["Money Flow"] = int(cmf_positive)
+
+    total = int(sum(components.values()))
+    label = "VERY HIGH" if total >= 9 else "HIGH" if total >= 7 else "MODERATE" if total >= 5 else "LOW"
+    result.update({
+        "available": True,
+        "score": total,
+        "label": label,
+        "components": components,
+        "checks": checks,
+        "rsi": rsi_now,
+        "cmf": cmf_now,
+        "bb_width": bbw_now,
+        "bb_width_20th_pct": bbw_p20,
+    })
+    return result
+
+
 
 def calculate_score(
     box_result: dict[str, Any],
@@ -1410,6 +1619,15 @@ def analyze_daily_symbol(
     else:
         rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, stock_benchmark_ticker, stock_benchmark_df)
     score = calculate_score(box, trend, dry, rs)
+    if ticker in {"BTC-USD", "ETH-USD"}:
+        pre_benchmark_ticker = "BTC-USD"
+        pre_benchmark_df = btc_df
+    else:
+        pre_benchmark_ticker = stock_benchmark_ticker
+        pre_benchmark_df = stock_benchmark_df
+    pre_breakout = evaluate_pre_breakout_momentum(
+        asset_df, pre_benchmark_df, ticker, pre_benchmark_ticker
+    )
     state = box.get("state", "NO VALID BOX")
     latest_close = safe_float(asset_df["Close"].iloc[-1])
     breakout_level = safe_float(box.get("breakout_level"))
@@ -1431,6 +1649,12 @@ def analyze_daily_symbol(
         "State": state,
         "Price": latest_close,
         "Strategy Score": score["Total"],
+        "Pre-Breakout Score": pre_breakout.get("score", 0),
+        "Pre-Breakout Label": pre_breakout.get("label", "N/A"),
+        "Pre-Breakout Components": pre_breakout.get("components", {}),
+        "RSI": pre_breakout.get("rsi", np.nan),
+        "CMF": pre_breakout.get("cmf", np.nan),
+        "BB Width": pre_breakout.get("bb_width", np.nan),
         "Box High": safe_float(box.get("box_high")),
         "Breakout Level": breakout_level,
         "Distance to Breakout %": distance_pct,
@@ -1466,6 +1690,7 @@ def send_daily_scan_email(
             lines.append(
                 f"{r['Ticker']} | Price {format_currency(r['Price'])} | Overall {r['Strategy Score']}/100 | "
                 f"Core {r.get('Core Score', r['Strategy Score'])}/100 | "
+                f"Pre-Breakout {safe_float(r.get('Pre-Breakout Score')):.0f}/10 ({r.get('Pre-Breakout Label','N/A')}) | "
                 f"Squeeze {safe_float(r.get('Short Squeeze Potential')):.0f}/100 ({r.get('Short Squeeze Label','N/A')}) | "
                 f"SI Bonus +{r.get('Squeeze Bonus',0)} | Volume {r['Volume Multiple']:.2f}x | Breakout {format_currency(r['Breakout Level'])}"
             )
@@ -1485,6 +1710,7 @@ def send_daily_scan_email(
             lines.append(
                 f"{r['Ticker']} | Price {format_currency(r['Price'])} | Overall {r['Strategy Score']}/100 | "
                 f"Core {r.get('Core Score', r['Strategy Score'])}/100 | "
+                f"Pre-Breakout {safe_float(r.get('Pre-Breakout Score')):.0f}/10 ({r.get('Pre-Breakout Label','N/A')}) | "
                 f"Squeeze {safe_float(r.get('Short Squeeze Potential')):.0f}/100 ({r.get('Short Squeeze Label','N/A')}) | "
                 f"SI Bonus +{r.get('Squeeze Bonus',0)} | Distance {r['Distance to Breakout %']:.2f}% | 5-day probability {prob_text} | "
                 f"Volume {r['Volume Multiple']:.2f}x"
@@ -1907,6 +2133,10 @@ def main() -> None:
                     "Price": r.get("Price"),
                     "Overall Score": r.get("Strategy Score"),
                     "Core Score": r.get("Core Score", r.get("Strategy Score")),
+                    "Pre-Breakout": r.get("Pre-Breakout Score"),
+                    "Pre-Breakout Label": r.get("Pre-Breakout Label"),
+                    "RSI": r.get("RSI"),
+                    "CMF": r.get("CMF"),
                     "Squeeze": r.get("Short Squeeze Potential"),
                     "SI Bonus": r.get("Squeeze Bonus", 0),
                     "Distance %": r.get("Distance to Breakout %"),
@@ -1951,9 +2181,27 @@ def main() -> None:
             }), hide_index=True, use_container_width=True
         )
 
+        prebreak_accuracy = pre_breakout_accuracy_frame()
+        if not prebreak_accuracy.empty:
+            st.markdown("#### Accuracy by Pre-Breakout Momentum Score")
+            st.caption(
+                "This is the key validation table for deciding later whether the 0-10 "
+                "leading-indicator score deserves weight in Overall Score."
+            )
+            st.dataframe(
+                prebreak_accuracy.style.format({
+                    "Success Rate %": "{:.1f}%",
+                    "Avg 5-Day Return %": "{:+.2f}%",
+                    "Avg Max Gain %": "{:+.2f}%",
+                    "Avg Max Drawdown %": "{:+.2f}%",
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
+
         with st.expander("Reviewed signal history"):
             cols = [c for c in [
-                "Ticker", "Signal Date", "Signal Type", "Signal Price", "Overall Score", "Score Band",
+                "Ticker", "Signal Date", "Signal Type", "Signal Price", "Overall Score", "Score Band", "Pre-Breakout Score",
                 "Review Date", "Day 5 Price", "5-Day Return %", "Max 5-Day Gain %",
                 "Max 5-Day Drawdown %", "Held Breakout", "Outcome"
             ] if c in accuracy_detail.columns]
@@ -1988,6 +2236,24 @@ def main() -> None:
     dry_up_result = evaluate_volume_dry_up(asset_df, settings)
     rs_result = evaluate_relative_strength(ticker, asset_df, btc_df)
     core_score = calculate_score(box_result, trend_result, dry_up_result, rs_result)
+
+    # For the single-ticker panel, stocks use the active index benchmark (SPY/QQQ);
+    # crypto uses BTC. This matches the batch scanner's pre-breakout logic.
+    if ticker in {"BTC-USD", "ETH-USD"}:
+        pre_benchmark_ticker = "BTC-USD"
+        pre_benchmark_df = btc_df
+    else:
+        try:
+            raw_pre_benchmark = download_market_data(ACTIVE_BENCHMARK, settings.history_period)
+            pre_benchmark_df = add_indicators(raw_pre_benchmark, settings) if not raw_pre_benchmark.empty else None
+        except Exception:
+            pre_benchmark_df = None
+        pre_benchmark_ticker = ACTIVE_BENCHMARK
+
+    pre_breakout = evaluate_pre_breakout_momentum(
+        asset_df, pre_benchmark_df, ticker, pre_benchmark_ticker
+    )
+
     squeeze_snapshot = fetch_short_squeeze_snapshot(ticker, asset_df)
     score = calculate_score_with_squeeze(core_score, squeeze_snapshot)
 
@@ -2027,40 +2293,45 @@ def main() -> None:
         "Crypto daily candles from the data source may still be incomplete before the UTC day closes."
     )
 
-    metric_columns = st.columns(9)
+    metric_columns = st.columns(10)
     metric_columns[0].metric("Price", format_currency(latest["Close"]), f"{daily_change:.2f}%")
     metric_columns[1].metric("Overall Score", f"{score['Total']}/100")
     metric_columns[2].metric("Core Score", f"{score['Core Total']}/100")
     sq_display = safe_float(squeeze_snapshot.get("score"))
     metric_columns[3].metric(
+        "Pre-Breakout",
+        f"{pre_breakout.get('score', 0)}/10",
+        pre_breakout.get("label", "N/A"),
+    )
+    metric_columns[4].metric(
         "Short Squeeze",
         f"{sq_display:.0f}/100" if np.isfinite(sq_display) else "N/A",
         f"+{score['Short Squeeze Bonus']} bonus" if score['Short Squeeze Bonus'] else None,
     )
-    metric_columns[4].metric("State", box_result.get("state", "N/A"))
-    metric_columns[5].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
-    metric_columns[6].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
-    metric_columns[7].metric(
+    metric_columns[5].metric("State", box_result.get("state", "N/A"))
+    metric_columns[6].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
+    metric_columns[7].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
+    metric_columns[8].metric(
         "Breakout Volume",
         f"{safe_float(box_result.get('volume_multiple')):.2f}×"
         if np.isfinite(safe_float(box_result.get("volume_multiple")))
         else "N/A",
     )
     if breakout_probability.get("available"):
-        metric_columns[8].metric(
+        metric_columns[9].metric(
             "5-Day Breakout Prob.",
             f"{breakout_probability['probabilities'].get(5, np.nan):.0f}%",
             breakout_probability.get("confidence", ""),
         )
     elif breakout_targets.get("available"):
         first_target = breakout_targets["targets"][0]
-        metric_columns[8].metric(
+        metric_columns[9].metric(
             "Nearest Target",
             format_currency(first_target["price"]),
             f"{first_target['upside_from_price_pct']:+.1f}%",
         )
     else:
-        metric_columns[8].metric("Forecast", "N/A")
+        metric_columns[9].metric("Forecast", "N/A")
 
     tabs = st.tabs(
         [
@@ -2069,6 +2340,7 @@ def main() -> None:
             "Trend Template",
             "Volume Dry-Up",
             "Relative Strength",
+            "Pre-Breakout",
             "Breakout Forecast",
             "Raw Data",
         ]
@@ -2230,6 +2502,32 @@ def main() -> None:
             st.plotly_chart(fig, use_container_width=True)
 
     with tabs[5]:
+        st.subheader("Pre-Breakout Momentum")
+        st.caption(
+            "A separate 0-10 leading-indicator score. It is not added to Overall Score yet; "
+            "the 5-day validation history will tell us whether it deserves production weight."
+        )
+        pb_components = pre_breakout.get("components", {})
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("RS Leadership", f"{pb_components.get('Relative Strength', 0)}/3")
+        c2.metric("OBV", f"{pb_components.get('OBV', 0)}/2")
+        c3.metric("Compression", f"{pb_components.get('Volatility Compression', 0)}/2")
+        c4.metric("RSI Momentum", f"{pb_components.get('RSI Momentum', 0)}/2")
+        c5.metric("Money Flow", f"{pb_components.get('Money Flow', 0)}/1")
+
+        detail_rows = [
+            {"Measure": "Total Pre-Breakout Score", "Value": f"{pre_breakout.get('score', 0)}/10"},
+            {"Measure": "Signal Band", "Value": pre_breakout.get("label", "N/A")},
+            {"Measure": "RSI(14)", "Value": f"{safe_float(pre_breakout.get('rsi')):.1f}" if np.isfinite(safe_float(pre_breakout.get('rsi'))) else "N/A"},
+            {"Measure": "CMF(20)", "Value": f"{safe_float(pre_breakout.get('cmf')):.3f}" if np.isfinite(safe_float(pre_breakout.get('cmf'))) else "N/A"},
+            {"Measure": "Bollinger Width", "Value": f"{safe_float(pre_breakout.get('bb_width')):.2f}%" if np.isfinite(safe_float(pre_breakout.get('bb_width'))) else "N/A"},
+        ]
+        st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
+
+        for label, passed in pre_breakout.get("checks", {}).items():
+            st.write(f"{'✅' if passed else '❌'} {label}")
+
+    with tabs[6]:
         st.subheader("Breakout Forecast")
 
         # Compact upside summary for WATCH / CONFIRMED states
@@ -2359,7 +2657,7 @@ def main() -> None:
         else:
             st.info("Forecast outputs appear when the state is BREAKOUT WATCH or a price/confirmed breakout is detected.")
 
-    with tabs[6]:
+    with tabs[7]:
         display_columns = [
             "Open",
             "High",
@@ -2371,6 +2669,10 @@ def main() -> None:
             "SMA_150",
             "SMA_200",
             "ATR_Pct",
+            "RSI_14",
+            "OBV",
+            "BB_Width",
+            "CMF_20",
             "Distance_From_365D_High_Pct",
         ]
         export = asset_df[display_columns].copy().sort_index(ascending=False)
