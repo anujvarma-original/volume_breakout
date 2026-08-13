@@ -66,6 +66,9 @@ SIGNAL_HISTORY_FILE = Path(
 
 DEFAULT_TICKERS = "BTC-USD, ETH-USD, SPY, QQQ, NVDA, AAPL"
 
+# Expensive historical probability calibration runs only for stronger WATCH setups.
+MIN_WATCH_SCORE_FOR_PROBABILITY = 60
+
 def parse_tickers(raw: str) -> list[str]:
     """Accept comma-, whitespace-, or newline-separated Yahoo Finance symbols."""
     normalized = raw.replace("\n", ",").replace("\t", ",").replace(" ", ",")
@@ -1636,9 +1639,23 @@ def analyze_daily_symbol(
         if np.isfinite(breakout_level) and breakout_level != 0 else np.nan
     )
 
-    probability = {"available": False, "probabilities": {}}
+    probability = {
+        "available": False,
+        "probabilities": {},
+        "reason": "Not calculated",
+    }
     if state == "BREAKOUT WATCH":
-        probability = estimate_breakout_probability(asset_df, settings, box, trend, dry)
+        if score["Total"] >= MIN_WATCH_SCORE_FOR_PROBABILITY:
+            probability = estimate_breakout_probability(asset_df, settings, box, trend, dry)
+        else:
+            probability = {
+                "available": False,
+                "probabilities": {},
+                "reason": (
+                    f"Skipped for speed: Core Score {score['Total']}/100 is below "
+                    f"{MIN_WATCH_SCORE_FOR_PROBABILITY}"
+                ),
+            }
 
     targets = {"available": False, "targets": []}
     if state in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}:
@@ -1662,6 +1679,11 @@ def analyze_daily_symbol(
         "Box Quality": safe_float(box.get("quality_score")),
         "5-Day Probability %": probability.get("probabilities", {}).get(5, np.nan),
         "Probability Confidence": probability.get("confidence", "N/A") if probability.get("available") else "N/A",
+        "Probability Status": (
+            "Calculated"
+            if probability.get("available")
+            else probability.get("reason", "Not available")
+        ),
         "Targets": targets.get("targets", []),
         "Latest Date": asset_df.index[-1].strftime("%Y-%m-%d"),
     }
@@ -1760,7 +1782,13 @@ def run_daily_market_scan(
     scan_universe = list(dict.fromkeys(stock_symbols + ["BTC-USD", "ETH-USD"]))
     download_symbols = list(dict.fromkeys(scan_universe + [stock_benchmark_ticker]))
 
-    market_data = download_market_data_batch(tuple(download_symbols), settings.history_period, chunk_size=50)
+    # Keep Yahoo OHLCV traffic batched: ~10 requests for the S&P 500 rather than
+    # hundreds of per-symbol history requests.
+    market_data = download_market_data_batch(
+        tuple(download_symbols),
+        settings.history_period,
+        chunk_size=50,
+    )
     if stock_benchmark_ticker not in market_data or "BTC-USD" not in market_data:
         raise RuntimeError(
             f"Benchmark data for {stock_benchmark_ticker} and/or BTC-USD could not be downloaded."
@@ -1796,7 +1824,9 @@ def run_daily_market_scan(
     for r in alerts:
         ticker = r.get("Ticker", "")
         raw = market_data.get(ticker)
-        asset_df = add_indicators(raw, settings) if raw is not None and not raw.empty else None
+        # The squeeze snapshot only needs the Volume series for relative-volume
+        # context, so do not recalculate every technical indicator here.
+        asset_df = raw if raw is not None and not raw.empty else None
         sq = fetch_short_squeeze_snapshot(ticker, asset_df)
         core = int(r.get("Strategy Score", 0))
         bonus = get_squeeze_bonus(safe_float(sq.get("score"))) if sq.get("available") else 0
