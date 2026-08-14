@@ -768,6 +768,106 @@ def evaluate_relative_strength(
             "passed": passed, "total": len(checks), "ratio_series": aligned,
             "latest_ratio": safe_float(latest[ratio_col]), "ratio_column": ratio_col}
 
+
+def detect_momentum_breakout(df: pd.DataFrame, settings: Settings) -> dict[str, Any]:
+    """Detect a breakout that is accelerating without a classical Darvas base.
+
+    This is deliberately a parallel path, not a relaxed Darvas box.  It uses prior
+    20/55-session highs as resistance, recent price acceleration, and relative
+    volume.  The returned shape mirrors ``detect_current_box`` so the existing
+    score/target/email machinery can reuse it.
+    """
+    if len(df) < 60:
+        return {"valid": False, "state": "NO MOMENTUM SETUP", "reason": "At least 60 candles are required"}
+
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+    prior = df.iloc[:-1]
+
+    latest_close = safe_float(latest["Close"])
+    previous_close = safe_float(previous["Close"])
+    prior_high_20 = safe_float(prior["High"].tail(20).max())
+    prior_high_55 = safe_float(prior["High"].tail(55).max())
+    prior_low_20 = safe_float(prior["Low"].tail(20).min())
+
+    latest_volume = safe_float(latest["Volume"], 0.0)
+    average_volume = safe_float(prior["Volume"].tail(20).mean(), 0.0)
+    volume_multiple = latest_volume / average_volume if average_volume > 0 else np.nan
+
+    ret_5 = (latest_close / safe_float(df["Close"].iloc[-6]) - 1) * 100 if len(df) >= 6 else np.nan
+    ret_20 = (latest_close / safe_float(df["Close"].iloc[-21]) - 1) * 100 if len(df) >= 21 else np.nan
+
+    # Use the nearer 20-day ceiling for entry detection while rewarding a 55-day high.
+    breakout_level = prior_high_20 * (1 + settings.breakout_buffer_pct / 100)
+    near_breakout_floor = prior_high_20 * 0.98
+    price_breakout = bool(np.isfinite(breakout_level) and latest_close > breakout_level)
+    was_below_or_near = bool(np.isfinite(prior_high_20) and previous_close <= prior_high_20 * 1.015)
+    volume_breakout = bool(np.isfinite(volume_multiple) and volume_multiple >= settings.breakout_volume_multiple)
+
+    near_55_high = bool(np.isfinite(prior_high_55) and latest_close >= prior_high_55 * 0.98)
+    strong_5d = bool(np.isfinite(ret_5) and ret_5 >= 3.0)
+    strong_20d = bool(np.isfinite(ret_20) and ret_20 >= 7.0)
+    acceleration = strong_5d or strong_20d
+
+    # A momentum breakout must either clear the 20-day ceiling or be within 2% of it,
+    # and it must show genuine recent acceleration.
+    actionable = acceleration and (price_breakout or latest_close >= near_breakout_floor)
+    confirmed_breakout = bool(actionable and price_breakout and volume_breakout)
+    price_only_breakout = bool(actionable and price_breakout and not volume_breakout)
+    breakout_watch = bool(actionable and not price_breakout and latest_close >= near_breakout_floor)
+
+    if confirmed_breakout:
+        state = "CONFIRMED BREAKOUT"
+    elif price_only_breakout:
+        state = "PRICE BREAKOUT / WEAK VOLUME"
+    elif breakout_watch:
+        state = "BREAKOUT WATCH"
+    else:
+        state = "NO MOMENTUM SETUP"
+
+    quality_score = 0.0
+    if actionable:
+        quality_score += 30 if price_breakout else 18
+        quality_score += 20 if near_55_high else 0
+        quality_score += min(25.0, max(0.0, safe_float(ret_5, 0.0)) * 2.5)
+        quality_score += min(15.0, max(0.0, safe_float(ret_20, 0.0)))
+        quality_score += 10 if volume_breakout else min(7.0, max(0.0, safe_float(volume_multiple, 0.0)) * 4)
+        quality_score = min(100.0, quality_score)
+
+    return {
+        "valid": actionable,
+        "structure_type": "MOMENTUM",
+        "state": state,
+        "reason": "20/55-day momentum breakout path",
+        "box_high": prior_high_20,
+        "box_low": prior_low_20,
+        "box_range_pct": ((prior_high_20 - prior_low_20) / ((prior_high_20 + prior_low_20) / 2) * 100) if np.isfinite(prior_high_20) and np.isfinite(prior_low_20) and prior_high_20 > prior_low_20 else np.nan,
+        "high_tests": 0,
+        "low_tests": 0,
+        "inside_ratio": np.nan,
+        "breakout_level": breakout_level,
+        "latest_close": latest_close,
+        "previous_close": previous_close,
+        "volume_multiple": volume_multiple,
+        "price_breakout": price_breakout,
+        "volume_breakout": volume_breakout,
+        "confirmed_breakout": confirmed_breakout,
+        "base_days": 20,
+        "quality_score": quality_score,
+        "atr_contracting": False,
+        "candidate_count": 1 if actionable else 0,
+        "momentum_5d_pct": ret_5,
+        "momentum_20d_pct": ret_20,
+        "prior_high_55": prior_high_55,
+        "near_55_high": near_55_high,
+        "checks": {
+            "At/above 20-day resistance": bool(price_breakout or latest_close >= near_breakout_floor),
+            "Recent price acceleration": acceleration,
+            "Near 55-day high": near_55_high,
+            "Volume confirmation": volume_breakout,
+        },
+    }
+
 def calculate_score(
     box_result: dict[str, Any],
     trend_result: dict[str, Any],
@@ -1080,19 +1180,33 @@ def make_price_chart(
             )
         )
 
-    if box_result.get("box_start") in visible.index or box_result.get("box_end") in visible.index:
-        box_start = max(box_result["box_start"], visible.index.min())
+    box_start_value = box_result.get("box_start")
+    box_end_value = box_result.get("box_end")
+    box_low_value = safe_float(box_result.get("box_low"))
+    box_high_value = safe_float(box_result.get("box_high"))
+    breakout_level_value = safe_float(box_result.get("breakout_level"))
+    is_darvas_structure = str(box_result.get("structure_type", "DARVAS")).upper() == "DARVAS"
+
+    if (
+        is_darvas_structure
+        and box_start_value is not None
+        and (box_start_value in visible.index or box_end_value in visible.index)
+        and np.isfinite(box_low_value)
+        and np.isfinite(box_high_value)
+    ):
+        box_start = max(box_start_value, visible.index.min())
         fig.add_shape(
             type="rect",
             x0=box_start,
             x1=visible.index.max(),
-            y0=box_result["box_low"],
-            y1=box_result["box_high"],
+            y0=box_low_value,
+            y1=box_high_value,
             line={"width": 1.5, "dash": "dash"},
             fillcolor="rgba(120,120,120,0.10)",
         )
-        fig.add_hline(
-            y=box_result["breakout_level"],
+        if np.isfinite(breakout_level_value):
+            fig.add_hline(
+                y=breakout_level_value,
             line_dash="dot",
             annotation_text="Breakout level",
         )
@@ -1400,7 +1514,23 @@ def analyze_daily_symbol(
     if len(asset_df) < minimum_rows:
         return {"Ticker": ticker, "Error": f"Only {len(asset_df)} candles"}
 
-    box = detect_current_box(asset_df, settings)
+    darvas_box = detect_current_box(asset_df, settings)
+    momentum_structure = detect_momentum_breakout(asset_df, settings)
+
+    # Prefer an actionable classical Darvas structure.  If none exists, allow the
+    # independent momentum-breakout path to surface fast leaders that never paused
+    # long enough to form a textbook box.
+    darvas_actionable = darvas_box.get("state") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
+    momentum_actionable = momentum_structure.get("state") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
+    if darvas_actionable:
+        box = dict(darvas_box)
+        box["structure_type"] = "DARVAS"
+    elif momentum_actionable:
+        box = momentum_structure
+    else:
+        box = dict(darvas_box)
+        box["structure_type"] = "DARVAS" if darvas_box.get("valid") else "NONE"
+
     trend = evaluate_trend_template(asset_df, settings)
     dry = evaluate_volume_dry_up(asset_df, settings)
     if ticker == "BTC-USD":
@@ -1429,6 +1559,7 @@ def analyze_daily_symbol(
     return {
         "Ticker": ticker,
         "State": state,
+        "Breakout Type": box.get("structure_type", "DARVAS"),
         "Price": latest_close,
         "Strategy Score": score["Total"],
         "Box High": safe_float(box.get("box_high")),
@@ -1450,7 +1581,7 @@ def send_daily_scan_email(
     universe_label: str,
 ) -> None:
     confirmed = [r for r in alerts if r.get("State") == "CONFIRMED BREAKOUT"]
-    watches = [r for r in alerts if r.get("State") == "BREAKOUT WATCH"]
+    watches = [r for r in alerts if r.get("State") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME"}]
 
     # High-conviction squeeze setup: strong strategy score + strong short-squeeze score.
     # Keep this as a separate ranked view; do not remove these names from the normal
@@ -1606,7 +1737,7 @@ def run_daily_market_scan(
         except Exception as exc:
             errors.append({"Ticker": ticker, "Error": str(exc)[:180]})
 
-    alerts = [r for r in results if r.get("State") in {"BREAKOUT WATCH", "CONFIRMED BREAKOUT"}]
+    alerts = [r for r in results if r.get("State") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}]
 
     # Fetch slower short-interest fundamentals only for actionable candidates. This
     # keeps the full S&P scan practical and ensures low-short-interest breakouts
@@ -1808,6 +1939,7 @@ def render_earnings_snapshot(ticker: str) -> None:
 
 def main() -> None:
     st.title("📦 Darvas + Minervini Volume Breakout Scanner")
+    st.caption("Build: Dual-Path Momentum Fix 2026-08-14-B")
     st.caption(f"Build: Daily {ACTIVE_SCAN_LABEL} + Crypto Breakout Scanner V4")
     st.caption(
         "Scan crypto, stocks and ETFs with the same Darvas-box, Minervini trend, "
@@ -2092,7 +2224,21 @@ def main() -> None:
         st.error(f"At least {minimum_rows} daily candles are required.")
         st.stop()
 
-    box_result = detect_current_box(asset_df, settings)
+    # Run both structure detectors for the interactive UI, matching the batch scanner.
+    darvas_result = detect_current_box(asset_df, settings)
+    momentum_result = detect_momentum_breakout(asset_df, settings)
+    darvas_actionable = darvas_result.get("state") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
+    momentum_actionable = momentum_result.get("state") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
+    if darvas_actionable:
+        box_result = dict(darvas_result)
+        box_result["structure_type"] = "DARVAS"
+    elif momentum_actionable:
+        box_result = dict(momentum_result)
+        box_result["structure_type"] = "MOMENTUM"
+    else:
+        box_result = dict(darvas_result)
+        box_result["structure_type"] = "DARVAS" if darvas_result.get("valid") else "NONE"
+
     trend_result = evaluate_trend_template(asset_df, settings)
     dry_up_result = evaluate_volume_dry_up(asset_df, settings)
     rs_result = evaluate_relative_strength(ticker, asset_df, btc_df)
@@ -2174,7 +2320,7 @@ def main() -> None:
     tabs = st.tabs(
         [
             "Overview",
-            "Darvas Box",
+            "Structure Details",
             "Trend Template",
             "Volume Dry-Up",
             "Relative Strength",
@@ -2199,44 +2345,75 @@ def main() -> None:
         )
         st.dataframe(score_table, hide_index=True, use_container_width=True)
 
-        if box_result["confirmed_breakout"]:
-            st.success(
-                "The latest candle meets the configured box, price-breakout and volume-confirmation rules."
-            )
-        elif box_result["state"] == "PRICE BREAKOUT / WEAK VOLUME":
-            st.warning(
-                "Price has cleared the breakout level, but volume has not reached the configured confirmation multiple."
-            )
-        elif box_result["state"] == "BREAKOUT WATCH":
-            st.warning("Price is within 2% of the current box high.")
-        elif box_result["valid"]:
-            st.info("A valid box is present, but price is not yet near a confirmed breakout.")
+        structure_type = box_result.get("structure_type", "DARVAS")
+        st.caption(f"Active breakout path: **{structure_type}**")
+        if box_result.get("confirmed_breakout"):
+            if structure_type == "MOMENTUM":
+                st.success("Momentum breakout confirmed: price cleared recent resistance with the configured volume confirmation.")
+            else:
+                st.success("Darvas breakout confirmed: price cleared the box with the configured volume confirmation.")
+        elif box_result.get("state") == "PRICE BREAKOUT / WEAK VOLUME":
+            st.warning("Price has cleared resistance, but volume has not reached the configured confirmation multiple.")
+        elif box_result.get("state") == "BREAKOUT WATCH":
+            if structure_type == "MOMENTUM":
+                st.warning("Momentum setup is within 2% of the recent 20-day resistance level.")
+            else:
+                st.warning("Price is within 2% of the current Darvas box high.")
+        elif box_result.get("valid"):
+            st.info("A valid Darvas structure is present, but price is not yet near a breakout.")
         else:
-            st.error("The selected lookback does not currently form a valid Darvas box.")
+            st.info("No actionable Darvas or momentum breakout structure is active on the latest daily candle.")
 
     with tabs[1]:
-        details = {
-            "Status": box_result["state"],
-            "Detected base length": f"{box_result.get('base_days', 0)} days",
-            "Base quality": f"{box_result.get('quality_score', 0):.1f}/100",
-            "Box start": box_result["box_start"].strftime("%Y-%m-%d"),
-            "Box end": box_result["box_end"].strftime("%Y-%m-%d"),
-            "Box high": format_currency(box_result["box_high"]),
-            "Box low": format_currency(box_result["box_low"]),
-            "Box range": f"{box_result['box_range_pct']:.2f}%",
-            "Upper-bound tests": box_result["high_tests"],
-            "Lower-bound tests": box_result["low_tests"],
-            "Closes contained": f"{box_result['inside_ratio'] * 100:.1f}%",
-            "Breakout level": format_currency(box_result["breakout_level"]),
-            "Price breakout": "Yes" if box_result["price_breakout"] else "No",
-            "Volume confirmation": "Yes" if box_result["volume_breakout"] else "No",
-        }
-        st.dataframe(
-            pd.DataFrame(details.items(), columns=["Measure", "Value"]),
-            hide_index=True,
-            use_container_width=True,
-        )
-        render_checks("Box Qualification", box_result["checks"])
+        structure_type = box_result.get("structure_type", "DARVAS")
+        if structure_type == "MOMENTUM":
+            details = {
+                "Breakout path": "MOMENTUM",
+                "Status": box_result.get("state", "N/A"),
+                "20-day resistance": format_currency(box_result.get("box_high")),
+                "55-day prior high": format_currency(box_result.get("prior_high_55")),
+                "20-day range low": format_currency(box_result.get("box_low")),
+                "Breakout level": format_currency(box_result.get("breakout_level")),
+                "5-day momentum": f"{safe_float(box_result.get('momentum_5d_pct')):+.2f}%",
+                "20-day momentum": f"{safe_float(box_result.get('momentum_20d_pct')):+.2f}%",
+                "Near 55-day high": "Yes" if box_result.get("near_55_high") else "No",
+                "Price breakout": "Yes" if box_result.get("price_breakout") else "No",
+                "Volume multiple": f"{safe_float(box_result.get('volume_multiple')):.2f}x",
+                "Volume confirmation": "Yes" if box_result.get("volume_breakout") else "No",
+                "Momentum quality": f"{safe_float(box_result.get('quality_score'), 0):.1f}/100",
+            }
+            st.subheader("Momentum Breakout Structure")
+            st.dataframe(pd.DataFrame(details.items(), columns=["Measure", "Value"]), hide_index=True, use_container_width=True)
+            render_checks("Momentum Qualification", box_result.get("checks", {}))
+        elif box_result.get("valid"):
+            box_start = box_result.get("box_start")
+            box_end = box_result.get("box_end")
+            details = {
+                "Breakout path": "DARVAS",
+                "Status": box_result.get("state", "N/A"),
+                "Detected base length": f"{box_result.get('base_days', 0)} days",
+                "Base quality": f"{safe_float(box_result.get('quality_score'), 0):.1f}/100",
+                "Box start": box_start.strftime("%Y-%m-%d") if hasattr(box_start, "strftime") else "N/A",
+                "Box end": box_end.strftime("%Y-%m-%d") if hasattr(box_end, "strftime") else "N/A",
+                "Box high": format_currency(box_result.get("box_high")),
+                "Box low": format_currency(box_result.get("box_low")),
+                "Box range": f"{safe_float(box_result.get('box_range_pct')):.2f}%",
+                "Upper-bound tests": box_result.get("high_tests", 0),
+                "Lower-bound tests": box_result.get("low_tests", 0),
+                "Closes contained": f"{safe_float(box_result.get('inside_ratio'), 0) * 100:.1f}%",
+                "Breakout level": format_currency(box_result.get("breakout_level")),
+                "Price breakout": "Yes" if box_result.get("price_breakout") else "No",
+                "Volume confirmation": "Yes" if box_result.get("volume_breakout") else "No",
+            }
+            st.subheader("Darvas Box Structure")
+            st.dataframe(pd.DataFrame(details.items(), columns=["Measure", "Value"]), hide_index=True, use_container_width=True)
+            render_checks("Box Qualification", box_result.get("checks", {}))
+        else:
+            st.info("No valid Darvas box and no actionable momentum breakout structure were found for the latest daily candle.")
+            if darvas_result.get("reason"):
+                st.caption(f"Darvas: {darvas_result.get('reason')}")
+            if momentum_result.get("reason"):
+                st.caption(f"Momentum: {momentum_result.get('reason')}")
 
     with tabs[2]:
         left, right = st.columns([1, 1])
