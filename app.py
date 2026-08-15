@@ -868,6 +868,197 @@ def detect_momentum_breakout(df: pd.DataFrame, settings: Settings) -> dict[str, 
         },
     }
 
+
+def _rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _adx_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    tr = pd.concat([(high-low), (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+    dx = 100 * (plus_di-minus_di).abs() / (plus_di+minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1/period, adjust=False).mean()
+
+
+def evaluate_momentum_box(asset_df: pd.DataFrame, benchmark_df: pd.DataFrame | None = None, include_history: bool = True) -> dict[str, Any]:
+    """Independent 0-100 momentum regime score; does not require a Darvas box."""
+    if asset_df is None or asset_df.empty or len(asset_df) < 60:
+        return {"available": False, "score": 0, "label": "N/A", "trajectory": "N/A", "components": {}, "measurements": {}, "history": []}
+
+    df = asset_df.copy()
+    close = df["Close"]
+    rsi = _rsi_series(close)
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    macd_hist = macd - macd_signal
+    adx = _adx_series(df)
+    vol_avg20 = df["Volume"].rolling(20).mean()
+    rel_vol = df["Volume"] / vol_avg20.replace(0, np.nan)
+    ret5 = close.pct_change(5) * 100
+    ret20 = close.pct_change(20) * 100
+
+    rs20 = np.nan
+    if benchmark_df is not None and not benchmark_df.empty:
+        aligned = pd.concat([close.rename("a"), benchmark_df["Close"].rename("b")], axis=1, join="inner").dropna()
+        if len(aligned) >= 21:
+            rs20 = ((aligned["a"].iloc[-1]/aligned["a"].iloc[-21]-1) - (aligned["b"].iloc[-1]/aligned["b"].iloc[-21]-1))*100
+
+    # Higher-high / higher-low test using recent 5-session windows.
+    hh = safe_float(df["High"].tail(5).max()) > safe_float(df["High"].iloc[-10:-5].max())
+    hl = safe_float(df["Low"].tail(5).min()) > safe_float(df["Low"].iloc[-10:-5].min())
+
+    rv = safe_float(rel_vol.iloc[-1])
+    r = safe_float(rsi.iloc[-1])
+    r_prev = safe_float(rsi.iloc[-3])
+    mh = safe_float(macd_hist.iloc[-1])
+    mh_prev = safe_float(macd_hist.iloc[-3])
+    a = safe_float(adx.iloc[-1])
+    a_prev = safe_float(adx.iloc[-3])
+    r5 = safe_float(ret5.iloc[-1])
+    r20 = safe_float(ret20.iloc[-1])
+
+    components = {}
+    # RSI 15
+    components["RSI"] = 15 if (r >= 60 and r > r_prev) else 12 if r >= 60 else 9 if (r >= 50 and r > r_prev) else 5 if r >= 45 else 0
+    # MACD 15
+    components["MACD"] = 15 if (mh > 0 and mh > mh_prev) else 11 if mh > 0 else 6 if mh > mh_prev else 0
+    # ADX 15
+    components["ADX"] = 15 if (a >= 25 and a > a_prev) else 11 if a >= 25 else 7 if (a >= 20 and a > a_prev) else 3 if a >= 15 else 0
+    # Relative volume 15; don't punish quiet accumulation too harshly
+    components["Relative Volume"] = 15 if rv >= 1.5 else 12 if rv >= 1.2 else 9 if rv >= 1.0 else 6 if rv >= 0.8 else 2
+    # Price momentum 15
+    pm = 0
+    if np.isfinite(r5): pm += 8 if r5 >= 5 else 6 if r5 >= 3 else 4 if r5 > 0 else 0
+    if np.isfinite(r20): pm += 7 if r20 >= 10 else 5 if r20 >= 5 else 3 if r20 > 0 else 0
+    components["Price Momentum"] = min(15, pm)
+    # Relative strength 15
+    components["Relative Strength"] = 15 if np.isfinite(rs20) and rs20 >= 7 else 12 if np.isfinite(rs20) and rs20 >= 3 else 8 if np.isfinite(rs20) and rs20 > 0 else 4 if not np.isfinite(rs20) else 0
+    # Price structure 10
+    components["Price Structure"] = 10 if (hh and hl) else 6 if (hh or hl) else 0
+
+    score = int(round(sum(components.values())))
+    if score >= 80: label = "EXPLOSIVE MOMENTUM"
+    elif score >= 65: label = "STRONG BULLISH MOMENTUM"
+    elif score >= 50: label = "BUILDING MOMENTUM"
+    elif score >= 35: label = "NEUTRAL MOMENTUM"
+    elif score >= 20: label = "WEAK / BEARISH MOMENTUM"
+    else: label = "STRONG BEARISH MOMENTUM"
+
+    # Full trajectory is useful in the UI but expensive across hundreds of stocks.
+    # Batch mode requests only the current score and labels trajectory as CURRENT.
+    hist=[]
+    trajectory="CURRENT"
+    if include_history:
+        for offset in (3,2,1,0):
+            pos = len(df) - 1 - offset
+            if pos < 59:
+                continue
+            rr=safe_float(rsi.iloc[pos]); rrp=safe_float(rsi.iloc[max(0,pos-2)])
+            hhst=safe_float(macd_hist.iloc[pos]); hp=safe_float(macd_hist.iloc[max(0,pos-2)])
+            aa=safe_float(adx.iloc[pos]); ap=safe_float(adx.iloc[max(0,pos-2)])
+            vv=safe_float(rel_vol.iloc[pos]); q5=safe_float(ret5.iloc[pos]); q20=safe_float(ret20.iloc[pos])
+            left=max(0,pos-4); prev_left=max(0,pos-9); prev_right=max(0,pos-4)
+            hh2=safe_float(df["High"].iloc[left:pos+1].max()) > safe_float(df["High"].iloc[prev_left:prev_right+1].max())
+            hl2=safe_float(df["Low"].iloc[left:pos+1].min()) > safe_float(df["Low"].iloc[prev_left:prev_right+1].min())
+            c1=15 if (rr>=60 and rr>rrp) else 12 if rr>=60 else 9 if (rr>=50 and rr>rrp) else 5 if rr>=45 else 0
+            c2=15 if (hhst>0 and hhst>hp) else 11 if hhst>0 else 6 if hhst>hp else 0
+            c3=15 if (aa>=25 and aa>ap) else 11 if aa>=25 else 7 if (aa>=20 and aa>ap) else 3 if aa>=15 else 0
+            c4=15 if vv>=1.5 else 12 if vv>=1.2 else 9 if vv>=1.0 else 6 if vv>=0.8 else 2
+            c5=(8 if q5>=5 else 6 if q5>=3 else 4 if q5>0 else 0)+(7 if q20>=10 else 5 if q20>=5 else 3 if q20>0 else 0)
+            c6=components["Relative Strength"]
+            c7=10 if (hh2 and hl2) else 6 if (hh2 or hl2) else 0
+            hist.append({"Date": df.index[pos].strftime("%Y-%m-%d"), "Score": int(round(c1+c2+c3+c4+c5+c6+c7))})
+        trajectory="STABLE →"
+        if len(hist)>=2:
+            delta=hist[-1]["Score"]-hist[0]["Score"]
+            trajectory="ACCELERATING ↑" if delta>=10 else "IMPROVING ↑" if delta>=4 else "DECELERATING ↓" if delta<=-10 else "SOFTENING ↓" if delta<=-4 else "STABLE →"
+
+    measurements={
+        "RSI (14)": r, "MACD histogram": mh, "ADX (14)": a, "Relative volume": rv,
+        "5-day return %": r5, "20-day return %": r20, "Relative strength vs benchmark (20D %)": rs20,
+        "Higher high": hh, "Higher low": hl,
+    }
+    return {"available": True, "score": score, "label": label, "trajectory": trajectory, "components": components, "measurements": measurements, "history": hist}
+
+
+def calculate_momentum_targets(asset_df: pd.DataFrame, momentum_box: dict[str, Any], horizon_sessions: int = 5) -> dict[str, Any]:
+    """Estimate a momentum-skewed high/low price envelope over the next few sessions.
+
+    Uses current ATR as the volatility unit and skews the upside/downside multiples
+    according to the 0-100 Momentum Box score and its trajectory. These are reference
+    levels for scenario planning, not guaranteed forecasts.
+    """
+    if asset_df is None or asset_df.empty or not momentum_box.get("available"):
+        return {"available": False}
+
+    price = safe_float(asset_df["Close"].iloc[-1])
+    atr = safe_float(asset_df["ATR"].iloc[-1]) if "ATR" in asset_df.columns else np.nan
+    score = safe_float(momentum_box.get("score"), 50.0)
+    if not (np.isfinite(price) and price > 0 and np.isfinite(atr) and atr > 0):
+        return {"available": False}
+
+    strength = max(0.0, min(1.0, score / 100.0))
+    trajectory = str(momentum_box.get("trajectory", ""))
+
+    # Strong momentum widens the upside envelope and tightens the downside envelope.
+    # Weak momentum does the opposite. The trajectory contributes a modest adjustment.
+    up_mult = 1.15 + 1.85 * strength
+    down_mult = 2.25 - 1.20 * strength
+    if "ACCELERATING" in trajectory:
+        up_mult += 0.35
+        down_mult -= 0.15
+    elif "IMPROVING" in trajectory:
+        up_mult += 0.20
+        down_mult -= 0.10
+    elif "DECELERATING" in trajectory:
+        up_mult -= 0.25
+        down_mult += 0.25
+    elif "SOFTENING" in trajectory:
+        up_mult -= 0.15
+        down_mult += 0.15
+
+    # Normalize gently for the requested horizon. Five sessions is the baseline.
+    horizon_scale = max(0.5, min(2.0, (max(1, horizon_sessions) / 5.0) ** 0.5))
+    up_mult *= horizon_scale
+    down_mult *= horizon_scale
+    up_mult = max(0.75, up_mult)
+    down_mult = max(0.75, down_mult)
+
+    high_target = price + atr * up_mult
+    low_target = max(0.01, price - atr * down_mult)
+
+    # Nearby structure is informative, but momentum/ATR remains the primary driver.
+    prior20_high = safe_float(asset_df["High"].iloc[-21:-1].max()) if len(asset_df) >= 21 else np.nan
+    prior20_low = safe_float(asset_df["Low"].iloc[-21:-1].min()) if len(asset_df) >= 21 else np.nan
+
+    return {
+        "available": True,
+        "horizon_sessions": int(horizon_sessions),
+        "current_price": price,
+        "atr": atr,
+        "high_target": high_target,
+        "low_target": low_target,
+        "high_upside_pct": (high_target / price - 1.0) * 100.0,
+        "low_downside_pct": (low_target / price - 1.0) * 100.0,
+        "up_atr_multiple": up_mult,
+        "down_atr_multiple": down_mult,
+        "prior_20d_high": prior20_high,
+        "prior_20d_low": prior20_low,
+    }
+
 def calculate_score(
     box_result: dict[str, Any],
     trend_result: dict[str, Any],
@@ -1508,25 +1699,64 @@ def analyze_daily_symbol(
     stock_benchmark_df: pd.DataFrame,
     btc_df: pd.DataFrame,
     stock_benchmark_ticker: str = "SPY",
+    fast_batch: bool = False,
 ) -> dict[str, Any]:
+    """Analyze one symbol.
+
+    fast_batch=True is optimized for large-universe scans:
+      * evaluate the cheap momentum path first;
+      * only run the exhaustive Darvas-base search when price is near recent resistance;
+      * defer historical analog probability and target generation to stage 2.
+    The interactive single-ticker UI keeps the full analysis path.
+    """
     asset_df = add_indicators(raw_df, settings)
     minimum_rows = max(221, settings.max_base_days + 2)
     if len(asset_df) < minimum_rows:
         return {"Ticker": ticker, "Error": f"Only {len(asset_df)} candles"}
 
-    darvas_box = detect_current_box(asset_df, settings)
     momentum_structure = detect_momentum_breakout(asset_df, settings)
+    momentum_actionable = momentum_structure.get("state") in {
+        "BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"
+    }
 
-    # Prefer an actionable classical Darvas structure.  If none exists, allow the
-    # independent momentum-breakout path to surface fast leaders that never paused
-    # long enough to form a textbook box.
-    darvas_actionable = darvas_box.get("state") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
-    momentum_actionable = momentum_structure.get("state") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
+    # Fast universe scans should not spend 15..90 base-length iterations on stocks
+    # that are nowhere near recent resistance. A 5% cushion is deliberately loose
+    # so classical setups are not screened out merely because of a small wick.
+    run_darvas = True
+    if fast_batch and not momentum_actionable:
+        prior = asset_df.iloc[:-1]
+        prior_high_20 = safe_float(prior["High"].tail(20).max())
+        prior_high_55 = safe_float(prior["High"].tail(55).max())
+        latest_close_gate = safe_float(asset_df["Close"].iloc[-1])
+        near_20 = np.isfinite(prior_high_20) and latest_close_gate >= prior_high_20 * 0.95
+        near_55 = np.isfinite(prior_high_55) and latest_close_gate >= prior_high_55 * 0.95
+        run_darvas = bool(near_20 or near_55)
+
+    if run_darvas:
+        darvas_box = detect_current_box(asset_df, settings)
+    else:
+        darvas_box = {
+            "valid": False,
+            "state": "NO VALID BOX",
+            "reason": "Fast batch prefilter: price is not near recent resistance",
+            "box_high": np.nan,
+            "box_low": np.nan,
+            "quality_score": 0.0,
+            "breakout_level": np.nan,
+            "volume_multiple": np.nan,
+            "confirmed_breakout": False,
+            "price_breakout": False,
+        }
+
+    darvas_actionable = darvas_box.get("state") in {
+        "BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"
+    }
     if darvas_actionable:
         box = dict(darvas_box)
         box["structure_type"] = "DARVAS"
     elif momentum_actionable:
-        box = momentum_structure
+        box = dict(momentum_structure)
+        box["structure_type"] = "MOMENTUM"
     else:
         box = dict(darvas_box)
         box["structure_type"] = "DARVAS" if darvas_box.get("valid") else "NONE"
@@ -1535,10 +1765,16 @@ def analyze_daily_symbol(
     dry = evaluate_volume_dry_up(asset_df, settings)
     if ticker == "BTC-USD":
         rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "BTC-USD", btc_df)
+        mb_benchmark = btc_df
     elif ticker == "ETH-USD":
         rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, "BTC-USD", btc_df)
+        mb_benchmark = btc_df
     else:
-        rs = evaluate_relative_strength_vs_benchmark(ticker, asset_df, stock_benchmark_ticker, stock_benchmark_df)
+        rs = evaluate_relative_strength_vs_benchmark(
+            ticker, asset_df, stock_benchmark_ticker, stock_benchmark_df
+        )
+        mb_benchmark = stock_benchmark_df
+
     score = calculate_score(box, trend, dry, rs)
     state = box.get("state", "NO VALID BOX")
     latest_close = safe_float(asset_df["Close"].iloc[-1])
@@ -1548,18 +1784,23 @@ def analyze_daily_symbol(
         if np.isfinite(breakout_level) and breakout_level != 0 else np.nan
     )
 
-    probability = {"available": False, "probabilities": {}}
-    if state == "BREAKOUT WATCH":
-        probability = estimate_breakout_probability(asset_df, settings, box, trend, dry)
+    # Momentum Box is useful across the whole universe, but batch mode avoids the
+    # trajectory/history recomputation. The UI gets the full version later.
+    momentum_box = evaluate_momentum_box(asset_df, mb_benchmark, include_history=not fast_batch)
+    momentum_targets = calculate_momentum_targets(asset_df, momentum_box, horizon_sessions=5)
 
+    probability = {"available": False, "probabilities": {}}
     targets = {"available": False, "targets": []}
-    if state in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}:
-        targets = calculate_breakout_targets(asset_df, box)
+    if not fast_batch:
+        if state == "BREAKOUT WATCH":
+            probability = estimate_breakout_probability(asset_df, settings, box, trend, dry)
+        if state in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}:
+            targets = calculate_breakout_targets(asset_df, box)
 
     return {
         "Ticker": ticker,
         "State": state,
-        "Breakout Type": box.get("structure_type", "DARVAS"),
+        "Breakout Type": box.get("structure_type", "NONE"),
         "Price": latest_close,
         "Strategy Score": score["Total"],
         "Box High": safe_float(box.get("box_high")),
@@ -1570,6 +1811,13 @@ def analyze_daily_symbol(
         "5-Day Probability %": probability.get("probabilities", {}).get(5, np.nan),
         "Probability Confidence": probability.get("confidence", "N/A") if probability.get("available") else "N/A",
         "Targets": targets.get("targets", []),
+        "Momentum Box Score": int(momentum_box.get("score", 0)) if momentum_box.get("available") else 0,
+        "Momentum Box Label": momentum_box.get("label", "N/A"),
+        "Momentum Box Trajectory": momentum_box.get("trajectory", "N/A"),
+        "Momentum High Target": safe_float(momentum_targets.get("high_target")),
+        "Momentum Low Target": safe_float(momentum_targets.get("low_target")),
+        "Momentum High Upside %": safe_float(momentum_targets.get("high_upside_pct")),
+        "Momentum Low Downside %": safe_float(momentum_targets.get("low_downside_pct")),
         "Latest Date": asset_df.index[-1].strftime("%Y-%m-%d"),
     }
 
@@ -1642,7 +1890,8 @@ def send_daily_scan_email(
                 f"{r['Ticker']} | Price {format_currency(r['Price'])} | Overall {r['Strategy Score']}/100 | "
                 f"Core {r.get('Core Score', r['Strategy Score'])}/100 | "
                 f"Squeeze {safe_float(r.get('Short Squeeze Potential')):.0f}/100 ({r.get('Short Squeeze Label','N/A')}) | "
-                f"SI Bonus +{r.get('Squeeze Bonus',0)} | Volume {r['Volume Multiple']:.2f}x | Breakout {format_currency(r['Breakout Level'])}"
+                f"SI Bonus +{r.get('Squeeze Bonus',0)} | Volume {r['Volume Multiple']:.2f}x | Breakout {format_currency(r['Breakout Level'])} | "
+                f"Momentum Range {format_currency(safe_float(r.get('Momentum Low Target')))} to {format_currency(safe_float(r.get('Momentum High Target')))}"
             )
             for target in r.get("Targets", [])[:4]:
                 lines.append(
@@ -1662,7 +1911,8 @@ def send_daily_scan_email(
                 f"Core {r.get('Core Score', r['Strategy Score'])}/100 | "
                 f"Squeeze {safe_float(r.get('Short Squeeze Potential')):.0f}/100 ({r.get('Short Squeeze Label','N/A')}) | "
                 f"SI Bonus +{r.get('Squeeze Bonus',0)} | Distance {r['Distance to Breakout %']:.2f}% | 5-day probability {prob_text} | "
-                f"Volume {r['Volume Multiple']:.2f}x"
+                f"Volume {r['Volume Multiple']:.2f}x | "
+                f"Momentum Range {format_currency(safe_float(r.get('Momentum Low Target')))} to {format_currency(safe_float(r.get('Momentum High Target')))}"
             )
         lines.append("")
 
@@ -1728,7 +1978,8 @@ def run_daily_market_scan(
             continue
         try:
             result = analyze_daily_symbol(
-                ticker, raw, settings, stock_benchmark_df, btc_df, stock_benchmark_ticker
+                ticker, raw, settings, stock_benchmark_df, btc_df, stock_benchmark_ticker,
+                fast_batch=True,
             )
             if result.get("Error"):
                 errors.append({"Ticker": ticker, "Error": result["Error"]})
@@ -1739,13 +1990,36 @@ def run_daily_market_scan(
 
     alerts = [r for r in results if r.get("State") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}]
 
-    # Fetch slower short-interest fundamentals only for actionable candidates. This
-    # keeps the full S&P scan practical and ensures low-short-interest breakouts
-    # are never filtered out before the squeeze bonus is considered.
+    # Stage 2 enrichment runs only for actionable candidates. Historical analog
+    # probability, target construction and short-interest fundamentals are much
+    # more expensive than the universe-wide price/volume pass.
     for r in alerts:
         ticker = r.get("Ticker", "")
         raw = market_data.get(ticker)
         asset_df = add_indicators(raw, settings) if raw is not None and not raw.empty else None
+
+        if asset_df is not None and not asset_df.empty:
+            # Reconstruct only what the expensive enrichment needs.
+            if r.get("State") == "BREAKOUT WATCH":
+                if r.get("Breakout Type") == "MOMENTUM":
+                    current_structure = detect_momentum_breakout(asset_df, settings)
+                else:
+                    current_structure = detect_current_box(asset_df, settings)
+                current_trend = evaluate_trend_template(asset_df, settings)
+                current_dry = evaluate_volume_dry_up(asset_df, settings)
+                prob = estimate_breakout_probability(
+                    asset_df, settings, current_structure, current_trend, current_dry
+                )
+                r["5-Day Probability %"] = prob.get("probabilities", {}).get(5, np.nan)
+                r["Probability Confidence"] = prob.get("confidence", "N/A") if prob.get("available") else "N/A"
+
+            if r.get("Breakout Type") == "MOMENTUM":
+                target_structure = detect_momentum_breakout(asset_df, settings)
+            else:
+                target_structure = detect_current_box(asset_df, settings)
+            target_data = calculate_breakout_targets(asset_df, target_structure)
+            r["Targets"] = target_data.get("targets", [])
+
         sq = fetch_short_squeeze_snapshot(ticker, asset_df)
         core = int(r.get("Strategy Score", 0))
         bonus = get_squeeze_bonus(safe_float(sq.get("score"))) if sq.get("available") else 0
@@ -1940,7 +2214,7 @@ def render_earnings_snapshot(ticker: str) -> None:
 def main() -> None:
     st.title("📦 Darvas + Minervini Volume Breakout Scanner")
     st.caption("Build: Dual-Path Momentum Fix 2026-08-14-B")
-    st.caption(f"Build: Daily {ACTIVE_SCAN_LABEL} + Crypto Breakout Scanner V4")
+    st.caption(f"Build: Momentum Targets 2026-08-14-D — Daily {ACTIVE_SCAN_LABEL} + Crypto Breakout Scanner")
     st.caption(
         "Scan crypto, stocks and ETFs with the same Darvas-box, Minervini trend, "
         "volume-contraction and breakout logic."
@@ -2039,19 +2313,32 @@ def main() -> None:
         f"?scan={ACTIVE_SCAN_MODE}" + ("&autorun=1" if AUTO_RUN_DAILY_SCAN else ""),
         language=None,
     )
-    daily_left, daily_right = st.columns([1, 3])
-    with daily_left:
-        run_daily_now = st.button(
-            f"Run full {ACTIVE_SCAN_LABEL} scan now", type="primary", use_container_width=True
+    scan_col1, scan_col2 = st.columns(2)
+    with scan_col1:
+        run_sp500_now = st.button(
+            "Run Full S&P 500 Scan Now", type="primary", use_container_width=True
         )
-    with daily_right:
-        st.caption("For unattended once-daily execution, use the included GitHub Actions workflow / daily_scan.py runner.")
+    with scan_col2:
+        run_nasdaq100_now = st.button(
+            "Run Full Nasdaq 100 Scan Now", type="primary", use_container_width=True
+        )
 
-    # autorun=1 is useful for an automation/browser session. The normal daily-state
-    # guard prevents repeated emails on Streamlit reruns unless the manual button is used.
+    st.caption("For unattended once-daily execution, use the included GitHub Actions workflow / daily_scan.py runner.")
+
+    # Manual buttons explicitly choose their universe. autorun=1 continues to use
+    # the URL-selected ACTIVE_SCAN_MODE.
+    manual_scan_mode = (
+        "sp500" if run_sp500_now
+        else "nasdaq100" if run_nasdaq100_now
+        else None
+    )
+    run_daily_now = manual_scan_mode is not None
+    requested_scan_mode = manual_scan_mode or ACTIVE_SCAN_MODE
+    requested_scan_label = "NASDAQ-100" if requested_scan_mode == "nasdaq100" else "S&P 500"
+
     should_run_daily = run_daily_now or AUTO_RUN_DAILY_SCAN
     if should_run_daily:
-        progress = st.progress(0.0, text=f"Starting {ACTIVE_SCAN_LABEL} daily market scan...")
+        progress = st.progress(0.0, text=f"Starting {requested_scan_label} daily market scan...")
         def _update_progress(done: int, total: int, symbol: str) -> None:
             progress.progress(min(done / max(total, 1), 1.0), text=f"Scanning {symbol} ({done}/{total})")
         try:
@@ -2060,7 +2347,7 @@ def main() -> None:
                 send_email=True,
                 force=bool(run_daily_now),
                 progress_callback=_update_progress,
-                scan_mode=ACTIVE_SCAN_MODE,
+                scan_mode=requested_scan_mode,
             )
             progress.progress(1.0, text="Daily scan complete")
             if daily_result.get("skipped"):
@@ -2092,6 +2379,9 @@ def main() -> None:
                         "Distance %": r.get("Distance to Breakout %"),
                         "Volume x": r.get("Volume Multiple"),
                         "5-Day Prob. %": r.get("5-Day Probability %"),
+                        "Momentum Box": r.get("Momentum Box Score"),
+                        "Momentum High": r.get("Momentum High Target"),
+                        "Momentum Low": r.get("Momentum Low Target"),
                     }
 
                 high_squeeze = [
@@ -2208,6 +2498,11 @@ def main() -> None:
                 if ticker == "BTC-USD"
                 else download_market_data("BTC-USD", settings.history_period)
             )
+            raw_momentum_benchmark = (
+                raw_btc.copy()
+                if ticker.endswith("-USD")
+                else download_market_data(ACTIVE_BENCHMARK, settings.history_period)
+            )
     except Exception as exc:
         st.error(f"Could not load market data: {exc}")
         st.stop()
@@ -2218,6 +2513,7 @@ def main() -> None:
 
     asset_df = add_indicators(raw_asset, settings)
     btc_df = add_indicators(raw_btc, settings)
+    momentum_benchmark_df = add_indicators(raw_momentum_benchmark, settings)
 
     minimum_rows = max(221, settings.max_base_days + 2)
     if len(asset_df) < minimum_rows:
@@ -2242,6 +2538,8 @@ def main() -> None:
     trend_result = evaluate_trend_template(asset_df, settings)
     dry_up_result = evaluate_volume_dry_up(asset_df, settings)
     rs_result = evaluate_relative_strength(ticker, asset_df, btc_df)
+    momentum_box = evaluate_momentum_box(asset_df, momentum_benchmark_df)
+    momentum_targets = calculate_momentum_targets(asset_df, momentum_box, horizon_sessions=5)
     core_score = calculate_score(box_result, trend_result, dry_up_result, rs_result)
     squeeze_snapshot = fetch_short_squeeze_snapshot(ticker, asset_df)
     score = calculate_score_with_squeeze(core_score, squeeze_snapshot)
@@ -2282,27 +2580,28 @@ def main() -> None:
         "Crypto daily candles from the data source may still be incomplete before the UTC day closes."
     )
 
-    metric_columns = st.columns(9)
+    metric_columns = st.columns(10)
     metric_columns[0].metric("Price", format_currency(latest["Close"]), f"{daily_change:.2f}%")
     metric_columns[1].metric("Overall Score", f"{score['Total']}/100")
-    metric_columns[2].metric("Core Score", f"{score['Core Total']}/100")
+    metric_columns[2].metric("Momentum Box", f"{momentum_box.get('score',0)}/100", momentum_box.get('trajectory','N/A'))
+    metric_columns[4].metric("Core Score", f"{score['Core Total']}/100")
     sq_display = safe_float(squeeze_snapshot.get("score"))
     metric_columns[3].metric(
         "Short Squeeze",
         f"{sq_display:.0f}/100" if np.isfinite(sq_display) else "N/A",
         f"+{score['Short Squeeze Bonus']} bonus" if score['Short Squeeze Bonus'] else None,
     )
-    metric_columns[4].metric("State", box_result.get("state", "N/A"))
-    metric_columns[5].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
-    metric_columns[6].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
-    metric_columns[7].metric(
+    metric_columns[5].metric("State", box_result.get("state", "N/A"))
+    metric_columns[6].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
+    metric_columns[7].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
+    metric_columns[8].metric(
         "Breakout Volume",
         f"{safe_float(box_result.get('volume_multiple')):.2f}×"
         if np.isfinite(safe_float(box_result.get("volume_multiple")))
         else "N/A",
     )
     if breakout_probability.get("available"):
-        metric_columns[8].metric(
+        metric_columns[9].metric(
             "5-Day Breakout Prob.",
             f"{breakout_probability['probabilities'].get(5, np.nan):.0f}%",
             breakout_probability.get("confidence", ""),
@@ -2325,6 +2624,7 @@ def main() -> None:
             "Volume Dry-Up",
             "Relative Strength",
             "Breakout Forecast",
+            "Momentum Box",
             "Raw Data",
         ]
     )
@@ -2646,6 +2946,77 @@ def main() -> None:
             st.info("Forecast outputs appear when the state is BREAKOUT WATCH or a price/confirmed breakout is detected.")
 
     with tabs[6]:
+        st.subheader("Momentum Box")
+        if not momentum_box.get("available"):
+            st.info("Momentum Box requires at least 60 daily candles.")
+        else:
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Momentum Score", f"{momentum_box['score']}/100")
+            mc2.metric("Momentum State", momentum_box['label'])
+            mc3.metric("Trajectory", momentum_box['trajectory'])
+
+            if momentum_targets.get("available"):
+                st.markdown("#### Estimated 5-Day Momentum Range")
+                mt1, mt2, mt3 = st.columns(3)
+                mt1.metric(
+                    "Momentum High Target",
+                    format_currency(momentum_targets["high_target"]),
+                    f"{momentum_targets['high_upside_pct']:+.1f}%",
+                )
+                mt2.metric(
+                    "Current Price",
+                    format_currency(momentum_targets["current_price"]),
+                    f"ATR {format_currency(momentum_targets['atr'])}",
+                )
+                mt3.metric(
+                    "Momentum Low Target",
+                    format_currency(momentum_targets["low_target"]),
+                    f"{momentum_targets['low_downside_pct']:+.1f}%",
+                )
+                st.caption(
+                    "Momentum targets are a 5-session ATR/momentum scenario envelope. "
+                    "Stronger or accelerating momentum expands the high target and tightens the low target; "
+                    "weakening momentum does the reverse. These are reference levels, not guaranteed forecasts."
+                )
+
+            score_value = momentum_box['score']
+            if score_value >= 80:
+                st.success("🔥 EXPLOSIVE MOMENTUM — strong multi-factor bullish momentum alignment.")
+            elif score_value >= 65:
+                st.success("🟢 STRONG BULLISH MOMENTUM — momentum conditions are favorable.")
+            elif score_value >= 50:
+                st.warning("🟡 BUILDING MOMENTUM — bullish momentum is developing but not yet strong.")
+            elif score_value >= 35:
+                st.info("⚪ NEUTRAL MOMENTUM — no strong directional momentum regime.")
+            else:
+                st.error("🔴 BEARISH / WEAK MOMENTUM — momentum conditions are unfavorable.")
+
+            st.markdown("#### Component Scores")
+            component_df = pd.DataFrame([
+                {"Component": k, "Points": v, "Max": {"RSI":15,"MACD":15,"ADX":15,"Relative Volume":15,"Price Momentum":15,"Relative Strength":15,"Price Structure":10}.get(k,0)}
+                for k,v in momentum_box["components"].items()
+            ])
+            st.dataframe(component_df, hide_index=True, use_container_width=True)
+
+            st.markdown("#### Current Measurements")
+            measurement_rows=[]
+            for k,v in momentum_box["measurements"].items():
+                if isinstance(v, (bool, np.bool_)):
+                    disp = "Yes" if v else "No"
+                elif np.isfinite(safe_float(v)):
+                    disp = f"{safe_float(v):.2f}"
+                else:
+                    disp = "N/A"
+                measurement_rows.append({"Measure": k, "Value": disp})
+            st.dataframe(pd.DataFrame(measurement_rows), hide_index=True, use_container_width=True)
+
+            if momentum_box.get("history"):
+                st.markdown("#### Recent Momentum Score Trajectory")
+                hist_df = pd.DataFrame(momentum_box["history"])
+                st.dataframe(hist_df, hide_index=True, use_container_width=True)
+                st.line_chart(hist_df.set_index("Date")["Score"])
+
+    with tabs[7]:
         display_columns = [
             "Open",
             "High",
