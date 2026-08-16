@@ -11,6 +11,7 @@ import ssl
 from email.message import EmailMessage
 from pathlib import Path
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -2306,6 +2307,111 @@ def run_daily_market_scan(
 
 
 
+
+def run_short_squeeze_scan(
+    scan_mode: str = "sp500",
+    threshold: float = 70.0,
+    progress_callback=None,
+    max_workers: int = 6,
+) -> dict[str, Any]:
+    """Scan one stock universe specifically for high short-squeeze potential.
+
+    OHLCV is downloaded in 50-symbol batches. Short-interest fundamentals require
+    per-ticker Yahoo lookups, so those calls are parallelized conservatively.
+    This scan is independent of Darvas state: a stock does not need to be on
+    BREAKOUT WATCH to appear here.
+    """
+    mode = normalize_scan_mode(scan_mode)
+    label = "NASDAQ-100" if mode == "nasdaq100" else "S&P 500"
+    stock_symbols = get_nasdaq100_tickers() if mode == "nasdaq100" else get_sp500_tickers()
+
+    # No crypto/ETF symbols: the short-squeeze model is stock-specific.
+    stock_symbols = list(dict.fromkeys(stock_symbols))
+    market_data = download_market_data_batch(
+        tuple(stock_symbols),
+        default_daily_settings().history_period,
+        chunk_size=50,
+    )
+
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    total = len(stock_symbols)
+    completed = 0
+
+    def _one(ticker: str) -> tuple[str, dict[str, Any]]:
+        raw = market_data.get(ticker)
+        if raw is None or raw.empty:
+            return ticker, {"available": False, "error": "No market data"}
+        sq = fetch_short_squeeze_snapshot(ticker, raw)
+        return ticker, sq
+
+    # Conservative parallelism reduces runtime without hammering Yahoo too hard.
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
+        futures = {pool.submit(_one, ticker): ticker for ticker in stock_symbols}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total, ticker)
+            try:
+                _, sq = future.result()
+            except Exception as exc:
+                errors.append({"Ticker": ticker, "Error": str(exc)[:180]})
+                continue
+
+            if not sq.get("available"):
+                if sq.get("error"):
+                    errors.append({"Ticker": ticker, "Error": str(sq.get("error"))[:180]})
+                continue
+
+            score = safe_float(sq.get("score"))
+            if not np.isfinite(score) or score < threshold:
+                continue
+
+            raw = market_data.get(ticker)
+            latest_price = safe_float(raw["Close"].iloc[-1]) if raw is not None and not raw.empty else np.nan
+            return_20d = np.nan
+            if raw is not None and len(raw) >= 21:
+                p0 = safe_float(raw["Close"].iloc[-21])
+                p1 = safe_float(raw["Close"].iloc[-1])
+                if np.isfinite(p0) and p0 > 0 and np.isfinite(p1):
+                    return_20d = (p1 / p0 - 1) * 100
+
+            rows.append({
+                "Ticker": ticker,
+                "Price": latest_price,
+                "Squeeze Score": score,
+                "Squeeze Label": sq.get("label", "N/A"),
+                "Short % Float": (
+                    safe_float(sq.get("short_percent_float")) * 100
+                    if np.isfinite(safe_float(sq.get("short_percent_float")))
+                    else np.nan
+                ),
+                "Days to Cover": safe_float(sq.get("days_to_cover")),
+                "Short Interest Change %": safe_float(sq.get("short_change_pct")),
+                "Relative Volume": safe_float(sq.get("relative_volume")),
+                "20-Day Return %": return_20d,
+            })
+
+    rows.sort(
+        key=lambda r: (
+            safe_float(r.get("Squeeze Score"), -1),
+            safe_float(r.get("Short % Float"), -1),
+            safe_float(r.get("Days to Cover"), -1),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "universe": label,
+        "universe_count": total,
+        "threshold": threshold,
+        "candidates": rows,
+        "errors": errors,
+    }
+
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_short_squeeze_snapshot(ticker: str, asset_df=None) -> dict[str, Any]:
     r={"applicable":True,"available":False,"score":np.nan,"label":"N/A","short_percent_float":np.nan,
@@ -2543,7 +2649,7 @@ def main() -> None:
         f"?scan={ACTIVE_SCAN_MODE}" + ("&autorun=1" if AUTO_RUN_DAILY_SCAN else ""),
         language=None,
     )
-    scan_col1, scan_col2 = st.columns(2)
+    scan_col1, scan_col2, scan_col3 = st.columns(3)
     with scan_col1:
         run_sp500_now = st.button(
             "Run Full S&P 500 Scan Now", type="primary", use_container_width=True
@@ -2552,8 +2658,80 @@ def main() -> None:
         run_nasdaq100_now = st.button(
             "Run Full Nasdaq 100 Scan Now", type="primary", use_container_width=True
         )
+    with scan_col3:
+        run_squeeze_now = st.button(
+            "🔥 Scan Short Squeeze Candidates", use_container_width=True
+        )
 
-    st.caption("For unattended once-daily execution, use the included GitHub Actions workflow / daily_scan.py runner.")
+    st.caption(
+        "Short Squeeze scan uses the URL-selected universe "
+        f"({ACTIVE_SCAN_LABEL}) and is independent of Darvas breakout state. "
+        "For unattended once-daily breakout execution, use the GitHub Actions workflow / daily_scan.py runner."
+    )
+
+    if run_squeeze_now:
+        squeeze_threshold = 70.0
+        squeeze_progress = st.progress(
+            0.0,
+            text=f"Starting {ACTIVE_SCAN_LABEL} short-squeeze scan..."
+        )
+
+        def _update_squeeze_progress(done: int, total: int, symbol: str) -> None:
+            squeeze_progress.progress(
+                min(done / max(total, 1), 1.0),
+                text=f"Evaluating short squeeze: {symbol} ({done}/{total})",
+            )
+
+        try:
+            squeeze_result = run_short_squeeze_scan(
+                scan_mode=ACTIVE_SCAN_MODE,
+                threshold=squeeze_threshold,
+                progress_callback=_update_squeeze_progress,
+                max_workers=6,
+            )
+            squeeze_progress.progress(1.0, text="Short-squeeze scan complete")
+            squeeze_candidates = squeeze_result.get("candidates", [])
+
+            st.markdown(f"## 🔥 {ACTIVE_SCAN_LABEL} Short Squeeze Potential")
+            st.caption(
+                f"Candidates with Short Squeeze Potential >= {squeeze_threshold:.0f}/100. "
+                "This scan does not require a Darvas or Momentum breakout setup."
+            )
+
+            if squeeze_candidates:
+                squeeze_df = pd.DataFrame(squeeze_candidates)
+                st.dataframe(
+                    squeeze_df.style.format({
+                        "Price": "${:,.2f}",
+                        "Squeeze Score": "{:.1f}",
+                        "Short % Float": "{:.1f}%",
+                        "Days to Cover": "{:.2f}",
+                        "Short Interest Change %": "{:+.1f}%",
+                        "Relative Volume": "{:.2f}x",
+                        "20-Day Return %": "{:+.1f}%",
+                    }),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                st.success(
+                    f"Found {len(squeeze_candidates)} high-squeeze candidate(s) "
+                    f"from {squeeze_result.get('universe_count', 0)} {ACTIVE_SCAN_LABEL} securities."
+                )
+            else:
+                st.info(
+                    f"No {ACTIVE_SCAN_LABEL} stocks currently have a Short Squeeze Potential "
+                    f"score of {squeeze_threshold:.0f}/100 or higher."
+                )
+
+            if squeeze_result.get("errors"):
+                with st.expander(f"Squeeze scan warnings ({len(squeeze_result['errors'])})"):
+                    st.dataframe(
+                        pd.DataFrame(squeeze_result["errors"]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+        except Exception as exc:
+            st.error(f"Short-squeeze scan failed: {exc}")
 
     # Manual buttons explicitly choose their universe. autorun=1 continues to use
     # the URL-selected ACTIVE_SCAN_MODE.
