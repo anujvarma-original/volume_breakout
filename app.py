@@ -3912,11 +3912,26 @@ def main() -> None:
         )
         local_flags = compression_category_flags(local_row)
         st.markdown("#### Current Category Membership")
-        st.write(f"{'✅' if local_flags['triple'] else '—'} 💥 Triple Alignment")
-        st.write(f"{'✅' if local_flags['squeeze_momentum'] else '—'} 🔥 Short Squeeze + Momentum Compression")
-        st.write(f"{'✅' if local_flags['dual'] else '—'} 🚀 Dual Coiled + Bullish")
-        st.write(f"{'✅' if local_flags['darvas'] else '—'} ⚡ Darvas Compression")
-        st.write(f"{'✅' if local_flags['momentum'] else '—'} 🌀 Momentum Compression")
+
+        category_rows = [
+            ("triple", "💥 Triple Alignment"),
+            ("squeeze_momentum", "🔥 Short Squeeze + Momentum Compression"),
+            ("dual", "🚀 Dual Coiled + Bullish"),
+            ("darvas", "⚡ Darvas Compression"),
+            ("momentum", "🌀 Momentum Compression"),
+        ]
+        active_categories = [label for key, label in category_rows if local_flags.get(key, False)]
+        inactive_categories = [label for key, label in category_rows if not local_flags.get(key, False)]
+
+        if active_categories:
+            st.success("ACTIVE: " + "  |  ".join(active_categories))
+        else:
+            st.info("No compression categories are currently active for this ticker.")
+
+        st.markdown("**Category details**")
+        for key, label in category_rows:
+            status = "✅ ACTIVE" if local_flags.get(key, False) else "❌ NOT ACTIVE"
+            st.write(f"{status} — {label}")
 
     with tabs[9]:
         display_columns = [
