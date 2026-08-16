@@ -2651,30 +2651,24 @@ def run_daily_market_scan(
         or safe_float(r.get("Momentum Compression Score"), -1) >= 65
     ]
 
-    # Stage 2 enrichment runs only for actionable candidates. Historical analog
-    # probability and target construction are local calculations. Yahoo short-interest
-    # fundamentals are prefetched concurrently and cached so the UI does not appear
-    # frozen after the universe scan reaches 100%.
-    stock_alert_tickers = [
-        str(r.get("Ticker", "")) for r in alerts
-        if str(r.get("Ticker", ""))
-        and not str(r.get("Ticker", "")).endswith("-USD")
-        and str(r.get("Ticker", "")) not in {"SPY", "QQQ", "DIA", "IWM", "MDY", "RSP"}
-    ]
-    stock_alert_tickers = list(dict.fromkeys(stock_alert_tickers))
-    if stock_alert_tickers:
-        completed_enrichment = 0
-        with ThreadPoolExecutor(max_workers=min(6, len(stock_alert_tickers))) as pool:
-            futures = {pool.submit(fetch_short_interest_fundamentals, ticker): ticker for ticker in stock_alert_tickers}
+    # Stage 2 enrichment: prefetch slow Yahoo fundamentals concurrently using plain
+    # Python worker functions. Avoid Streamlit caching/context inside worker threads.
+    prefetched_short_interest: dict[str, dict[str, Any]] = {}
+    enrichment_tickers = [str(r.get("Ticker", "")) for r in alerts
+                          if str(r.get("Ticker", "")) and not str(r.get("Ticker", "")).endswith("-USD")
+                          and str(r.get("Ticker", "")) not in {"SPY","QQQ","DIA","IWM","MDY","RSP"}]
+    enrichment_tickers = list(dict.fromkeys(enrichment_tickers))
+    if enrichment_tickers:
+        with ThreadPoolExecutor(max_workers=min(6, len(enrichment_tickers))) as pool:
+            futures = {pool.submit(fetch_short_interest_fundamentals_plain, t): t for t in enrichment_tickers}
+            done_count = 0
             for future in as_completed(futures):
-                ticker = futures[future]
-                completed_enrichment += 1
-                try:
-                    future.result()
-                except Exception:
-                    pass
+                t = futures[future]
+                try: prefetched_short_interest[t] = future.result()
+                except Exception as exc: prefetched_short_interest[t] = {"available": False, "error": str(exc)}
+                done_count += 1
                 if enrichment_progress_callback:
-                    enrichment_progress_callback(completed_enrichment, len(stock_alert_tickers), ticker)
+                    enrichment_progress_callback(done_count, len(enrichment_tickers), t)
 
     for r in alerts:
         ticker = r.get("Ticker", "")
@@ -2713,7 +2707,7 @@ def run_daily_market_scan(
             target_data = calculate_breakout_targets(asset_df, target_structure)
             r["Targets"] = target_data.get("targets", [])
 
-        sq = fetch_short_squeeze_snapshot(ticker, asset_df)
+        sq = fetch_short_squeeze_snapshot(ticker, asset_df, prefetched_short_interest.get(ticker))
         core = int(r.get("Strategy Score", 0))
         bonus = get_squeeze_bonus(safe_float(sq.get("score"))) if sq.get("available") else 0
         r["Core Score"] = core
@@ -2889,84 +2883,53 @@ def run_short_squeeze_scan(
 
 
 
-@st.cache_data(ttl=14400, show_spinner=False)
-def fetch_short_interest_fundamentals(ticker: str) -> dict[str, Any]:
-    """Fetch slow-changing Yahoo short-interest fundamentals once per ticker.
-
-    Kept separate from OHLCV-derived metrics so Streamlit does not hash/cache a full
-    dataframe and so daily-scan enrichment can prefetch these calls concurrently.
-    """
-    result = {
-        "applicable": True, "available": False, "short_percent_float": np.nan,
-        "days_to_cover": np.nan, "short_change_pct": np.nan, "float_shares": np.nan,
-    }
-    if ticker.endswith("-USD") or ticker in {"SPY", "QQQ", "DIA", "IWM", "MDY", "RSP"}:
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_short_interest_fundamentals_plain(ticker: str) -> dict[str, Any]:
+    """Fetch Yahoo short-interest fundamentals without Streamlit caching."""
+    result = {"applicable": True, "available": False, "short_percent_float": float("nan"),
+              "days_to_cover": float("nan"), "short_change_pct": float("nan"), "float_shares": float("nan")}
+    if ticker.endswith("-USD") or ticker in {"SPY","QQQ","DIA","IWM","MDY","RSP"}:
         result["applicable"] = False
         return result
     try:
         info = yf.Ticker(ticker).info or {}
-        sp = safe_float(info.get("shortPercentOfFloat"))
-        dc = safe_float(info.get("shortRatio"))
-        ss = safe_float(info.get("sharesShort"))
-        pr = safe_float(info.get("sharesShortPriorMonth"))
-        fl = safe_float(info.get("floatShares"))
-        ch = (ss - pr) / pr * 100 if np.isfinite(ss) and np.isfinite(pr) and pr > 0 else np.nan
-        result.update({
-            "available": any(np.isfinite(x) for x in (sp, dc, ch, fl)),
-            "short_percent_float": sp,
-            "days_to_cover": dc,
-            "short_change_pct": ch,
-            "float_shares": fl,
-        })
+        sp = safe_float(info.get("shortPercentOfFloat")); dc = safe_float(info.get("shortRatio"))
+        ss = safe_float(info.get("sharesShort")); pr = safe_float(info.get("sharesShortPriorMonth")); fl = safe_float(info.get("floatShares"))
+        ch = (ss-pr)/pr*100 if np.isfinite(ss) and np.isfinite(pr) and pr>0 else np.nan
+        result.update({"available": any(np.isfinite(x) for x in (sp,dc,ch,fl)),
+                       "short_percent_float": sp, "days_to_cover": dc,
+                       "short_change_pct": ch, "float_shares": fl})
     except Exception as exc:
         result["error"] = str(exc)
     return result
 
 
-def fetch_short_squeeze_snapshot(ticker: str, asset_df=None) -> dict[str, Any]:
-    r = {"applicable": True, "available": False, "score": np.nan, "label": "N/A",
-         "short_percent_float": np.nan, "days_to_cover": np.nan, "short_change_pct": np.nan,
-         "relative_volume": np.nan, "components": {}}
-    fundamentals = fetch_short_interest_fundamentals(ticker)
+def fetch_short_squeeze_snapshot(ticker: str, asset_df=None, fundamentals: dict[str, Any] | None = None) -> dict[str, Any]:
+    r={"applicable":True,"available":False,"score":np.nan,"label":"N/A","short_percent_float":np.nan,
+       "days_to_cover":np.nan,"short_change_pct":np.nan,"relative_volume":np.nan,"components":{}}
+    fundamentals = fundamentals if fundamentals is not None else fetch_short_interest_fundamentals_plain(ticker)
     if not fundamentals.get("applicable", True):
-        r["applicable"] = False
-        return r
-    if fundamentals.get("error"):
-        r["error"] = fundamentals.get("error")
-
-    sp = safe_float(fundamentals.get("short_percent_float"))
-    dc = safe_float(fundamentals.get("days_to_cover"))
-    ch = safe_float(fundamentals.get("short_change_pct"))
-    fl = safe_float(fundamentals.get("float_shares"))
-    rv = mo = np.nan
-    if asset_df is not None and len(asset_df) >= 21:
-        av = safe_float(asset_df["Volume"].iloc[-21:-1].mean())
-        lv = safe_float(asset_df["Volume"].iloc[-1])
-        rv = lv / av if np.isfinite(av) and av > 0 else np.nan
-        c0 = safe_float(asset_df["Close"].iloc[-21])
-        c1 = safe_float(asset_df["Close"].iloc[-1])
-        mo = (c1 / c0 - 1) * 100 if np.isfinite(c0) and c0 > 0 else np.nan
-
-    c = {}
-    if np.isfinite(sp): c["sf"] = max(0, min(100, (sp - .05) / .25 * 100))
-    if np.isfinite(dc): c["dc"] = max(0, min(100, (dc - 1) / 9 * 100))
-    if np.isfinite(ch): c["chg"] = max(0, min(100, (ch + 10) / 40 * 100))
-    if np.isfinite(fl) and fl > 0: c["float"] = max(0, min(100, (500e6 - fl) / 480e6 * 100))
-    if np.isfinite(rv): c["rv"] = max(0, min(100, (rv - .7) / 1.8 * 100))
-    if np.isfinite(mo): c["mom"] = max(0, min(100, (mo + 5) / 25 * 100))
-    wt = {"sf": 35, "dc": 20, "chg": 10, "float": 10, "rv": 15, "mom": 10}
-    aw = sum(wt[k] for k in c)
-    sc = sum(c[k] * wt[k] for k in c) / aw if aw else np.nan
-    r.update({
-        "available": bool(c),
-        "score": sc,
-        "label": "HIGH" if sc >= 70 else "MODERATE" if sc >= 45 else "LOW",
-        "short_percent_float": sp,
-        "days_to_cover": dc,
-        "short_change_pct": ch,
-        "relative_volume": rv,
-        "components": c,
-    })
+        r["applicable"] = False; return r
+    if fundamentals.get("error"): r["error"] = fundamentals.get("error")
+    sp=safe_float(fundamentals.get("short_percent_float")); dc=safe_float(fundamentals.get("days_to_cover"))
+    ch=safe_float(fundamentals.get("short_change_pct")); fl=safe_float(fundamentals.get("float_shares"))
+    rv=mo=np.nan
+    if asset_df is not None and len(asset_df)>=21:
+        av=safe_float(asset_df["Volume"].iloc[-21:-1].mean()); lv=safe_float(asset_df["Volume"].iloc[-1])
+        rv=lv/av if np.isfinite(av) and av>0 else np.nan
+        c0=safe_float(asset_df["Close"].iloc[-21]); c1=safe_float(asset_df["Close"].iloc[-1])
+        mo=(c1/c0-1)*100 if np.isfinite(c0) and c0>0 else np.nan
+    c={}
+    if np.isfinite(sp): c["sf"]=max(0,min(100,(sp-.05)/.25*100))
+    if np.isfinite(dc): c["dc"]=max(0,min(100,(dc-1)/9*100))
+    if np.isfinite(ch): c["chg"]=max(0,min(100,(ch+10)/40*100))
+    if np.isfinite(fl) and fl>0: c["float"]=max(0,min(100,(500e6-fl)/480e6*100))
+    if np.isfinite(rv): c["rv"]=max(0,min(100,(rv-.7)/1.8*100))
+    if np.isfinite(mo): c["mom"]=max(0,min(100,(mo+5)/25*100))
+    wt={"sf":35,"dc":20,"chg":10,"float":10,"rv":15,"mom":10}; aw=sum(wt[k] for k in c)
+    sc=sum(c[k]*wt[k] for k in c)/aw if aw else np.nan
+    r.update({"available":bool(c),"score":sc,"label":"HIGH" if sc>=70 else "MODERATE" if sc>=45 else "LOW",
+              "short_percent_float":sp,"days_to_cover":dc,"short_change_pct":ch,"relative_volume":rv,"components":c})
     return r
 
 def get_squeeze_bonus(squeeze_score: float) -> int:
@@ -3271,15 +3234,11 @@ def main() -> None:
     should_run_daily = run_daily_now or AUTO_RUN_DAILY_SCAN
     if should_run_daily:
         progress = st.progress(0.0, text=f"Starting {requested_scan_label} daily market scan...")
+        enrichment_progress = st.progress(0.0, text="Waiting for candidate enrichment...")
         def _update_progress(done: int, total: int, symbol: str) -> None:
             progress.progress(min(done / max(total, 1), 1.0), text=f"Scanning {symbol} ({done}/{total})")
-
-        enrichment_progress = st.progress(0.0, text="Candidate enrichment will begin after the market scan.")
         def _update_enrichment_progress(done: int, total: int, symbol: str) -> None:
-            enrichment_progress.progress(
-                min(done / max(total, 1), 1.0),
-                text=f"Enriching candidates: {symbol} ({done}/{total})",
-            )
+            enrichment_progress.progress(min(done / max(total, 1), 1.0), text=f"Enriching {symbol} ({done}/{total})")
         try:
             daily_result = run_daily_market_scan(
                 settings=settings,
@@ -3289,7 +3248,7 @@ def main() -> None:
                 enrichment_progress_callback=_update_enrichment_progress,
                 scan_mode=requested_scan_mode,
             )
-            progress.progress(1.0, text="Market scan complete")
+            progress.progress(1.0, text="Daily scan complete")
             enrichment_progress.progress(1.0, text="Candidate enrichment complete")
             if daily_result.get("skipped"):
                 st.info(f"{ACTIVE_SCAN_LABEL} scan already completed for {daily_result.get('scan_date')}; no duplicate email sent.")
