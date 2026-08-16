@@ -475,6 +475,16 @@ def safe_float(value: Any, default: float = np.nan) -> float:
         return default
 
 
+def format_direction_bias(bias: Any) -> str:
+    """Return an explicit, color-coded direction label for Streamlit UI."""
+    value = str(bias or "NEUTRAL").strip().upper()
+    if value == "BULLISH":
+        return "🟢 ↑ BULLISH"
+    if value == "BEARISH":
+        return "🔴 ↓ BEARISH"
+    return "⚪ → NEUTRAL"
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def download_market_data(ticker: str, period: str) -> pd.DataFrame:
     """Download daily OHLCV data and normalize yfinance output."""
@@ -1725,6 +1735,122 @@ def find_prior_resistance_levels(
     return levels[:max_levels]
 
 
+
+def score_resistance_strength(
+    df: pd.DataFrame,
+    level: float,
+    box_result: dict[str, Any],
+    tolerance_pct: float = 1.5,
+) -> dict[str, Any]:
+    """Estimate historical strength of one resistance level without altering target discovery."""
+    empty = {
+        "score": np.nan, "rating": "N/A", "tests": 0, "last_test": "N/A",
+        "avg_rejection_pct": np.nan, "avg_volume_multiple": np.nan, "confluence": 0,
+    }
+    if df is None or df.empty or not np.isfinite(safe_float(level)):
+        return empty
+
+    history = df.copy()
+    box_start = box_result.get("box_start")
+    if box_start is not None:
+        try:
+            history = history.loc[history.index < box_start]
+        except Exception:
+            pass
+    if len(history) < 10:
+        return empty
+
+    lvl = float(level)
+    tol = max(0.0025, tolerance_pct / 100.0)
+    highs = pd.to_numeric(history["High"], errors="coerce")
+    volumes = pd.to_numeric(history["Volume"], errors="coerce").fillna(0.0)
+    touch_mask = ((highs - lvl).abs() / max(lvl, 1e-9)) <= tol
+    touch_positions = np.flatnonzero(touch_mask.to_numpy())
+    if len(touch_positions) == 0:
+        return empty
+
+    # De-duplicate adjacent candles from the same test episode.
+    episodes = []
+    for pos in touch_positions:
+        if not episodes or pos - episodes[-1] > 3:
+            episodes.append(int(pos))
+    tests = len(episodes)
+
+    rejection_values = []
+    volume_values = []
+    for pos in episodes:
+        after = history.iloc[pos + 1:min(len(history), pos + 6)]
+        if not after.empty:
+            future_low = safe_float(pd.to_numeric(after["Low"], errors="coerce").min())
+            if np.isfinite(future_low) and lvl > 0:
+                rejection_values.append(max(0.0, (lvl - future_low) / lvl * 100.0))
+        prior_vol = safe_float(volumes.iloc[max(0, pos - 20):pos].mean(), 0.0)
+        current_vol = safe_float(volumes.iloc[pos], 0.0)
+        if prior_vol > 0:
+            volume_values.append(current_vol / prior_vol)
+
+    avg_rejection = float(np.mean(rejection_values)) if rejection_values else 0.0
+    avg_vm = float(np.mean(volume_values)) if volume_values else np.nan
+    last_pos = episodes[-1]
+    sessions_ago = max(0, len(history) - 1 - last_pos)
+    span_sessions = episodes[-1] - episodes[0] if tests > 1 else 0
+
+    touch_points = min(25.0, tests / 4.0 * 25.0)
+    rejection_points = min(20.0, avg_rejection / 5.0 * 20.0)
+    volume_points = min(15.0, max(0.0, (safe_float(avg_vm, 0.0) - 0.5) * 15.0))
+    recency_points = 10.0 if sessions_ago <= 20 else 8.0 if sessions_ago <= 60 else 5.0 if sessions_ago <= 120 else 2.0 if sessions_ago <= 250 else 0.0
+    significance_points = 15.0 if (tests >= 3 and span_sessions >= 60) else 10.0 if (tests >= 2 and span_sessions >= 30) else 5.0 if tests >= 2 else 0.0
+
+    confluence = 0
+    for window in (90, 180, 365):
+        if len(history) >= 20:
+            major_high = safe_float(pd.to_numeric(history["High"].tail(window), errors="coerce").max())
+            if np.isfinite(major_high) and major_high > 0 and abs(lvl - major_high) / major_high <= 0.015:
+                confluence += 1
+    confluence_points = min(15.0, confluence * 5.0)
+
+    score = int(round(min(100.0, touch_points + rejection_points + volume_points + recency_points + significance_points + confluence_points)))
+    rating = "VERY STRONG" if score >= 80 else "STRONG" if score >= 60 else "MODERATE" if score >= 40 else "WEAK"
+    last_test = history.index[last_pos]
+    return {
+        "score": score,
+        "rating": rating,
+        "tests": tests,
+        "last_test": last_test.strftime("%Y-%m-%d") if hasattr(last_test, "strftime") else str(last_test),
+        "avg_rejection_pct": avg_rejection,
+        "avg_volume_multiple": avg_vm,
+        "confluence": confluence,
+    }
+
+
+def add_resistance_break_scores(
+    targets: list[dict[str, Any]],
+    momentum_box: dict[str, Any] | None,
+    momentum_compression: dict[str, Any] | None,
+    short_squeeze_score: float = np.nan,
+    current_volume_multiple: float = np.nan,
+) -> list[dict[str, Any]]:
+    """Add heuristic 0-100 barrier-break scores to resistance targets."""
+    mb = safe_float((momentum_box or {}).get("score"), 0.0)
+    mc = safe_float((momentum_compression or {}).get("score"), 0.0)
+    squeeze = safe_float(short_squeeze_score, 0.0)
+    vol_mult = safe_float(current_volume_multiple, 0.0)
+    volume_score = min(100.0, max(0.0, vol_mult / 2.0 * 100.0))
+    bias = str((momentum_compression or {}).get("bias", "NEUTRAL")).upper()
+    for target in targets:
+        if target.get("type") != "Prior swing resistance":
+            continue
+        strength = safe_float(target.get("resistance_strength"), 50.0)
+        score = 0.35 * (100.0 - strength) + 0.25 * mb + 0.15 * mc + 0.15 * squeeze + 0.10 * volume_score
+        if bias == "BULLISH":
+            score += 5.0
+        elif bias == "BEARISH":
+            score -= 10.0
+        score = int(round(max(0.0, min(100.0, score))))
+        target["resistance_break_score"] = score
+        target["resistance_break_label"] = "HIGH" if score >= 75 else "FAVORABLE" if score >= 60 else "MIXED" if score >= 45 else "DIFFICULT"
+    return targets
+
 def calculate_breakout_targets(
     df: pd.DataFrame,
     box_result: dict[str, Any],
@@ -1743,7 +1869,19 @@ def calculate_breakout_targets(
 
     targets: list[dict[str, Any]] = []
     for idx, level in enumerate(find_prior_resistance_levels(df, box_result), start=1):
-        targets.append({"name": f"Resistance R{idx}", "price": level, "type": "Prior swing resistance"})
+        strength = score_resistance_strength(df, level, box_result)
+        targets.append({
+            "name": f"Resistance R{idx}",
+            "price": level,
+            "type": "Prior swing resistance",
+            "resistance_strength": strength.get("score"),
+            "resistance_rating": strength.get("rating"),
+            "resistance_tests": strength.get("tests"),
+            "resistance_last_test": strength.get("last_test"),
+            "resistance_avg_rejection_pct": strength.get("avg_rejection_pct"),
+            "resistance_test_volume_multiple": strength.get("avg_volume_multiple"),
+            "resistance_confluence_count": strength.get("confluence"),
+        })
 
     box_height = max(0.0, box_high - box_low)
     if box_height > 0:
@@ -2455,6 +2593,7 @@ def run_daily_market_scan(
     send_email: bool = True,
     force: bool = False,
     progress_callback=None,
+    enrichment_progress_callback=None,
     scan_mode: str | None = None,
 ) -> dict[str, Any]:
     """Scan the selected stock universe plus BTC/ETH and email WATCH/CONFIRMED results."""
@@ -2513,8 +2652,30 @@ def run_daily_market_scan(
     ]
 
     # Stage 2 enrichment runs only for actionable candidates. Historical analog
-    # probability, target construction and short-interest fundamentals are much
-    # more expensive than the universe-wide price/volume pass.
+    # probability and target construction are local calculations. Yahoo short-interest
+    # fundamentals are prefetched concurrently and cached so the UI does not appear
+    # frozen after the universe scan reaches 100%.
+    stock_alert_tickers = [
+        str(r.get("Ticker", "")) for r in alerts
+        if str(r.get("Ticker", ""))
+        and not str(r.get("Ticker", "")).endswith("-USD")
+        and str(r.get("Ticker", "")) not in {"SPY", "QQQ", "DIA", "IWM", "MDY", "RSP"}
+    ]
+    stock_alert_tickers = list(dict.fromkeys(stock_alert_tickers))
+    if stock_alert_tickers:
+        completed_enrichment = 0
+        with ThreadPoolExecutor(max_workers=min(6, len(stock_alert_tickers))) as pool:
+            futures = {pool.submit(fetch_short_interest_fundamentals, ticker): ticker for ticker in stock_alert_tickers}
+            for future in as_completed(futures):
+                ticker = futures[future]
+                completed_enrichment += 1
+                try:
+                    future.result()
+                except Exception:
+                    pass
+                if enrichment_progress_callback:
+                    enrichment_progress_callback(completed_enrichment, len(stock_alert_tickers), ticker)
+
     for r in alerts:
         ticker = r.get("Ticker", "")
         raw = market_data.get(ticker)
@@ -2564,6 +2725,13 @@ def run_daily_market_scan(
         mbox = safe_float(r.get("Momentum Box Score"), 0.0)
         sqscore = safe_float(r.get("Short Squeeze Potential"), 0.0)
         r["Squeeze-Momentum Score"] = round(0.45 * sqscore + 0.35 * mcomp + 0.20 * mbox, 1)
+        r["Targets"] = add_resistance_break_scores(
+            r.get("Targets", []),
+            {"score": mbox},
+            {"score": mcomp, "bias": r.get("Momentum Compression Bias", "NEUTRAL")},
+            short_squeeze_score=sqscore,
+            current_volume_multiple=safe_float(r.get("Volume Multiple")),
+        )
         flags = compression_category_flags(r)
         r["Triple Alignment"] = flags["triple"]
         r["Dual Coiled Bullish"] = flags["dual"]
@@ -2721,37 +2889,84 @@ def run_short_squeeze_scan(
 
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_short_squeeze_snapshot(ticker: str, asset_df=None) -> dict[str, Any]:
-    r={"applicable":True,"available":False,"score":np.nan,"label":"N/A","short_percent_float":np.nan,
-       "days_to_cover":np.nan,"short_change_pct":np.nan,"relative_volume":np.nan,"components":{}}
-    if ticker.endswith("-USD") or ticker in {"SPY","QQQ","DIA","IWM","MDY","RSP"}:
-        r["applicable"]=False; return r
+@st.cache_data(ttl=14400, show_spinner=False)
+def fetch_short_interest_fundamentals(ticker: str) -> dict[str, Any]:
+    """Fetch slow-changing Yahoo short-interest fundamentals once per ticker.
+
+    Kept separate from OHLCV-derived metrics so Streamlit does not hash/cache a full
+    dataframe and so daily-scan enrichment can prefetch these calls concurrently.
+    """
+    result = {
+        "applicable": True, "available": False, "short_percent_float": np.nan,
+        "days_to_cover": np.nan, "short_change_pct": np.nan, "float_shares": np.nan,
+    }
+    if ticker.endswith("-USD") or ticker in {"SPY", "QQQ", "DIA", "IWM", "MDY", "RSP"}:
+        result["applicable"] = False
+        return result
     try:
-        info=yf.Ticker(ticker).info or {}
-        sp=safe_float(info.get("shortPercentOfFloat")); dc=safe_float(info.get("shortRatio"))
-        ss=safe_float(info.get("sharesShort")); pr=safe_float(info.get("sharesShortPriorMonth"))
-        fl=safe_float(info.get("floatShares"))
-        ch=(ss-pr)/pr*100 if np.isfinite(ss) and np.isfinite(pr) and pr>0 else np.nan
-        rv=mo=np.nan
-        if asset_df is not None and len(asset_df)>=21:
-            av=safe_float(asset_df["Volume"].iloc[-21:-1].mean()); lv=safe_float(asset_df["Volume"].iloc[-1])
-            rv=lv/av if np.isfinite(av) and av>0 else np.nan
-            c0=safe_float(asset_df["Close"].iloc[-21]); c1=safe_float(asset_df["Close"].iloc[-1])
-            mo=(c1/c0-1)*100 if np.isfinite(c0) and c0>0 else np.nan
-        c={}
-        if np.isfinite(sp): c["sf"]=max(0,min(100,(sp-.05)/.25*100))
-        if np.isfinite(dc): c["dc"]=max(0,min(100,(dc-1)/9*100))
-        if np.isfinite(ch): c["chg"]=max(0,min(100,(ch+10)/40*100))
-        if np.isfinite(fl) and fl>0: c["float"]=max(0,min(100,(500e6-fl)/480e6*100))
-        if np.isfinite(rv): c["rv"]=max(0,min(100,(rv-.7)/1.8*100))
-        if np.isfinite(mo): c["mom"]=max(0,min(100,(mo+5)/25*100))
-        wt={"sf":35,"dc":20,"chg":10,"float":10,"rv":15,"mom":10}
-        aw=sum(wt[k] for k in c)
-        sc=sum(c[k]*wt[k] for k in c)/aw if aw else np.nan
-        r.update({"available":bool(c),"score":sc,"label":"HIGH" if sc>=70 else "MODERATE" if sc>=45 else "LOW",
-                  "short_percent_float":sp,"days_to_cover":dc,"short_change_pct":ch,"relative_volume":rv,"components":c})
-    except Exception as e: r["error"]=str(e)
+        info = yf.Ticker(ticker).info or {}
+        sp = safe_float(info.get("shortPercentOfFloat"))
+        dc = safe_float(info.get("shortRatio"))
+        ss = safe_float(info.get("sharesShort"))
+        pr = safe_float(info.get("sharesShortPriorMonth"))
+        fl = safe_float(info.get("floatShares"))
+        ch = (ss - pr) / pr * 100 if np.isfinite(ss) and np.isfinite(pr) and pr > 0 else np.nan
+        result.update({
+            "available": any(np.isfinite(x) for x in (sp, dc, ch, fl)),
+            "short_percent_float": sp,
+            "days_to_cover": dc,
+            "short_change_pct": ch,
+            "float_shares": fl,
+        })
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def fetch_short_squeeze_snapshot(ticker: str, asset_df=None) -> dict[str, Any]:
+    r = {"applicable": True, "available": False, "score": np.nan, "label": "N/A",
+         "short_percent_float": np.nan, "days_to_cover": np.nan, "short_change_pct": np.nan,
+         "relative_volume": np.nan, "components": {}}
+    fundamentals = fetch_short_interest_fundamentals(ticker)
+    if not fundamentals.get("applicable", True):
+        r["applicable"] = False
+        return r
+    if fundamentals.get("error"):
+        r["error"] = fundamentals.get("error")
+
+    sp = safe_float(fundamentals.get("short_percent_float"))
+    dc = safe_float(fundamentals.get("days_to_cover"))
+    ch = safe_float(fundamentals.get("short_change_pct"))
+    fl = safe_float(fundamentals.get("float_shares"))
+    rv = mo = np.nan
+    if asset_df is not None and len(asset_df) >= 21:
+        av = safe_float(asset_df["Volume"].iloc[-21:-1].mean())
+        lv = safe_float(asset_df["Volume"].iloc[-1])
+        rv = lv / av if np.isfinite(av) and av > 0 else np.nan
+        c0 = safe_float(asset_df["Close"].iloc[-21])
+        c1 = safe_float(asset_df["Close"].iloc[-1])
+        mo = (c1 / c0 - 1) * 100 if np.isfinite(c0) and c0 > 0 else np.nan
+
+    c = {}
+    if np.isfinite(sp): c["sf"] = max(0, min(100, (sp - .05) / .25 * 100))
+    if np.isfinite(dc): c["dc"] = max(0, min(100, (dc - 1) / 9 * 100))
+    if np.isfinite(ch): c["chg"] = max(0, min(100, (ch + 10) / 40 * 100))
+    if np.isfinite(fl) and fl > 0: c["float"] = max(0, min(100, (500e6 - fl) / 480e6 * 100))
+    if np.isfinite(rv): c["rv"] = max(0, min(100, (rv - .7) / 1.8 * 100))
+    if np.isfinite(mo): c["mom"] = max(0, min(100, (mo + 5) / 25 * 100))
+    wt = {"sf": 35, "dc": 20, "chg": 10, "float": 10, "rv": 15, "mom": 10}
+    aw = sum(wt[k] for k in c)
+    sc = sum(c[k] * wt[k] for k in c) / aw if aw else np.nan
+    r.update({
+        "available": bool(c),
+        "score": sc,
+        "label": "HIGH" if sc >= 70 else "MODERATE" if sc >= 45 else "LOW",
+        "short_percent_float": sp,
+        "days_to_cover": dc,
+        "short_change_pct": ch,
+        "relative_volume": rv,
+        "components": c,
+    })
     return r
 
 def get_squeeze_bonus(squeeze_score: float) -> int:
@@ -3058,15 +3273,24 @@ def main() -> None:
         progress = st.progress(0.0, text=f"Starting {requested_scan_label} daily market scan...")
         def _update_progress(done: int, total: int, symbol: str) -> None:
             progress.progress(min(done / max(total, 1), 1.0), text=f"Scanning {symbol} ({done}/{total})")
+
+        enrichment_progress = st.progress(0.0, text="Candidate enrichment will begin after the market scan.")
+        def _update_enrichment_progress(done: int, total: int, symbol: str) -> None:
+            enrichment_progress.progress(
+                min(done / max(total, 1), 1.0),
+                text=f"Enriching candidates: {symbol} ({done}/{total})",
+            )
         try:
             daily_result = run_daily_market_scan(
                 settings=settings,
                 send_email=True,
                 force=bool(run_daily_now),
                 progress_callback=_update_progress,
+                enrichment_progress_callback=_update_enrichment_progress,
                 scan_mode=requested_scan_mode,
             )
-            progress.progress(1.0, text="Daily scan complete")
+            progress.progress(1.0, text="Market scan complete")
+            enrichment_progress.progress(1.0, text="Candidate enrichment complete")
             if daily_result.get("skipped"):
                 st.info(f"{ACTIVE_SCAN_LABEL} scan already completed for {daily_result.get('scan_date')}; no duplicate email sent.")
             alerts = daily_result.get("alerts", [])
@@ -3373,6 +3597,18 @@ def main() -> None:
         else {"available": False, "targets": []}
     )
 
+    if breakout_targets.get("targets"):
+        breakout_targets["targets"] = add_resistance_break_scores(
+            breakout_targets["targets"],
+            momentum_box,
+            momentum_compression,
+            short_squeeze_score=safe_float(squeeze_snapshot.get("score")) if squeeze_snapshot.get("available") else np.nan,
+            current_volume_multiple=safe_float(box_result.get("volume_multiple")),
+        )
+        breakout_targets["nearest_resistance"] = next(
+            (t for t in breakout_targets["targets"] if t.get("type") == "Prior swing resistance"), None
+        )
+
     latest = asset_df.iloc[-1]
     prior = asset_df.iloc[-2]
     daily_change = (latest["Close"] / prior["Close"] - 1) * 100
@@ -3438,12 +3674,14 @@ def main() -> None:
     metric_columns[10].metric(
         "Darvas Pressure",
         f"{darvas_compression.get('score', 0)}/100" if darvas_compression.get("available") else "N/A",
-        darvas_compression.get("bias", "NEUTRAL"),
+        format_direction_bias(darvas_compression.get("bias", "NEUTRAL")),
+        delta_color="off",
     )
     metric_columns[11].metric(
         "Momentum Compression",
         f"{momentum_compression.get('score', 0)}/100" if momentum_compression.get("available") else "N/A",
-        momentum_compression.get("bias", "NEUTRAL"),
+        format_direction_bias(momentum_compression.get("bias", "NEUTRAL")),
+        delta_color="off",
     )
 
     tabs = st.tabs(
@@ -3744,6 +3982,15 @@ def main() -> None:
                     "Price": t["price"],
                     "Upside from Current (%)": t["upside_from_price_pct"],
                     "Upside from Breakout (%)": t["upside_from_breakout_pct"],
+                    "Resistance Strength": (
+                        f"{safe_float(t.get('resistance_strength')):.0f}/100 {t.get('resistance_rating','')}"
+                        if t.get("type") == "Prior swing resistance" and np.isfinite(safe_float(t.get("resistance_strength"))) else "—"
+                    ),
+                    "Break Score": (
+                        f"{safe_float(t.get('resistance_break_score')):.0f}/100 {t.get('resistance_break_label','')}"
+                        if t.get("type") == "Prior swing resistance" and np.isfinite(safe_float(t.get("resistance_break_score"))) else "—"
+                    ),
+                    "Tests": t.get("resistance_tests", "—") if t.get("type") == "Prior swing resistance" else "—",
                     "Basis": t["type"],
                 } for t in breakout_targets["targets"]]
                 target_df = pd.DataFrame(rows)
@@ -3759,9 +4006,16 @@ def main() -> None:
                 nearest = breakout_targets.get("nearest_resistance")
                 darvas = breakout_targets.get("darvas_target")
                 if nearest:
+                    strength = safe_float(nearest.get("resistance_strength"))
+                    break_score = safe_float(nearest.get("resistance_break_score"))
+                    extra = ""
+                    if np.isfinite(strength):
+                        extra += f" Strength {strength:.0f}/100 ({nearest.get('resistance_rating','N/A')})."
+                    if np.isfinite(break_score):
+                        extra += f" Break Score {break_score:.0f}/100 ({nearest.get('resistance_break_label','N/A')})."
                     st.info(
                         f"Nearest historical resistance is {format_currency(nearest['price'])} "
-                        f"({nearest['upside_from_price_pct']:+.1f}% from the latest close)."
+                        f"({nearest['upside_from_price_pct']:+.1f}% from the latest close)." + extra
                     )
                 if darvas:
                     st.info(
@@ -3878,7 +4132,7 @@ def main() -> None:
         d1, d2, d3 = st.columns(3)
         d1.metric("Darvas Breakout Pressure", f"{darvas_compression.get('score', 0)}/100" if darvas_compression.get("available") else "N/A")
         d2.metric("Darvas Compression Status", darvas_compression.get("status", "N/A"))
-        d3.metric("Darvas Bias", darvas_compression.get("bias", "NEUTRAL"))
+        d3.metric("Darvas Bias", format_direction_bias(darvas_compression.get("bias", "NEUTRAL")))
         if darvas_compression.get("available"):
             st.dataframe(
                 pd.DataFrame([{"Component": k, "Points": v} for k, v in darvas_compression.get("components", {}).items()]),
@@ -3889,7 +4143,7 @@ def main() -> None:
         m1, m2, m3 = st.columns(3)
         m1.metric("Momentum Compression Score", f"{momentum_compression.get('score', 0)}/100" if momentum_compression.get("available") else "N/A")
         m2.metric("Momentum Compression Status", momentum_compression.get("status", "N/A"))
-        m3.metric("Momentum Bias", momentum_compression.get("bias", "NEUTRAL"))
+        m3.metric("Momentum Bias", format_direction_bias(momentum_compression.get("bias", "NEUTRAL")))
         if momentum_compression.get("available"):
             st.dataframe(
                 pd.DataFrame([{"Component": k, "Points": v} for k, v in momentum_compression.get("components", {}).items()]),
@@ -3912,11 +4166,26 @@ def main() -> None:
         )
         local_flags = compression_category_flags(local_row)
         st.markdown("#### Current Category Membership")
-        st.write(f"{'✅' if local_flags['triple'] else '—'} 💥 Triple Alignment")
-        st.write(f"{'✅' if local_flags['squeeze_momentum'] else '—'} 🔥 Short Squeeze + Momentum Compression")
-        st.write(f"{'✅' if local_flags['dual'] else '—'} 🚀 Dual Coiled + Bullish")
-        st.write(f"{'✅' if local_flags['darvas'] else '—'} ⚡ Darvas Compression")
-        st.write(f"{'✅' if local_flags['momentum'] else '—'} 🌀 Momentum Compression")
+
+        category_rows = [
+            ("triple", "💥 Triple Alignment"),
+            ("squeeze_momentum", "🔥 Short Squeeze + Momentum Compression"),
+            ("dual", "🚀 Dual Coiled + Bullish"),
+            ("darvas", "⚡ Darvas Compression"),
+            ("momentum", "🌀 Momentum Compression"),
+        ]
+        active_categories = [label for key, label in category_rows if bool(local_flags.get(key, False))]
+
+        if active_categories:
+            st.markdown("**Active categories:** " + " · ".join(active_categories))
+        else:
+            st.caption("No compression categories are currently active for this ticker.")
+
+        for key, label in category_rows:
+            if bool(local_flags.get(key, False)):
+                st.markdown(f"✅ **ACTIVE** — {label}")
+            else:
+                st.caption(f"❌ NOT ACTIVE — {label}")
 
     with tabs[9]:
         display_columns = [
