@@ -475,6 +475,16 @@ def safe_float(value: Any, default: float = np.nan) -> float:
         return default
 
 
+def format_direction_bias(bias: Any) -> str:
+    """Return an explicit, color-coded direction label for Streamlit UI."""
+    value = str(bias or "NEUTRAL").strip().upper()
+    if value == "BULLISH":
+        return "🟢 ↑ BULLISH"
+    if value == "BEARISH":
+        return "🔴 ↓ BEARISH"
+    return "⚪ → NEUTRAL"
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def download_market_data(ticker: str, period: str) -> pd.DataFrame:
     """Download daily OHLCV data and normalize yfinance output."""
@@ -3438,12 +3448,14 @@ def main() -> None:
     metric_columns[10].metric(
         "Darvas Pressure",
         f"{darvas_compression.get('score', 0)}/100" if darvas_compression.get("available") else "N/A",
-        darvas_compression.get("bias", "NEUTRAL"),
+        format_direction_bias(darvas_compression.get("bias", "NEUTRAL")),
+        delta_color="off",
     )
     metric_columns[11].metric(
         "Momentum Compression",
         f"{momentum_compression.get('score', 0)}/100" if momentum_compression.get("available") else "N/A",
-        momentum_compression.get("bias", "NEUTRAL"),
+        format_direction_bias(momentum_compression.get("bias", "NEUTRAL")),
+        delta_color="off",
     )
 
     tabs = st.tabs(
@@ -3878,7 +3890,7 @@ def main() -> None:
         d1, d2, d3 = st.columns(3)
         d1.metric("Darvas Breakout Pressure", f"{darvas_compression.get('score', 0)}/100" if darvas_compression.get("available") else "N/A")
         d2.metric("Darvas Compression Status", darvas_compression.get("status", "N/A"))
-        d3.metric("Darvas Bias", darvas_compression.get("bias", "NEUTRAL"))
+        d3.metric("Darvas Bias", format_direction_bias(darvas_compression.get("bias", "NEUTRAL")))
         if darvas_compression.get("available"):
             st.dataframe(
                 pd.DataFrame([{"Component": k, "Points": v} for k, v in darvas_compression.get("components", {}).items()]),
@@ -3889,7 +3901,7 @@ def main() -> None:
         m1, m2, m3 = st.columns(3)
         m1.metric("Momentum Compression Score", f"{momentum_compression.get('score', 0)}/100" if momentum_compression.get("available") else "N/A")
         m2.metric("Momentum Compression Status", momentum_compression.get("status", "N/A"))
-        m3.metric("Momentum Bias", momentum_compression.get("bias", "NEUTRAL"))
+        m3.metric("Momentum Bias", format_direction_bias(momentum_compression.get("bias", "NEUTRAL")))
         if momentum_compression.get("available"):
             st.dataframe(
                 pd.DataFrame([{"Component": k, "Points": v} for k, v in momentum_compression.get("components", {}).items()]),
