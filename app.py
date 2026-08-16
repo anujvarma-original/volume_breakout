@@ -11,7 +11,6 @@ import ssl
 from email.message import EmailMessage
 from pathlib import Path
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -66,9 +65,6 @@ SIGNAL_HISTORY_FILE = Path(
 )
 
 DEFAULT_TICKERS = "BTC-USD, ETH-USD, SPY, QQQ, NVDA, AAPL"
-
-# Historical analog probability is expensive; reserve it for stronger WATCH setups.
-MIN_WATCH_SCORE_FOR_PROBABILITY = 60
 
 def parse_tickers(raw: str) -> list[str]:
     """Accept comma-, whitespace-, or newline-separated Yahoo Finance symbols."""
@@ -170,7 +166,6 @@ def record_new_signals(alerts: list[dict[str, Any]]) -> int:
             "Short Squeeze Potential": safe_float(r.get("Short Squeeze Potential")),
             "Volume Multiple": safe_float(r.get("Volume Multiple")),
             "5-Day Probability %": safe_float(r.get("5-Day Probability %")),
-            "Pre-Breakout Score": safe_float(r.get("Pre-Breakout Score")),
             "Status": "PENDING",
         })
         existing.add(signal_id)
@@ -304,51 +299,6 @@ def signal_accuracy_frames() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         })
 
     return detail, pd.DataFrame(type_groups), pd.DataFrame(band_groups)
-
-def pre_breakout_accuracy_frame() -> pd.DataFrame:
-    """Summarize reviewed 5-day outcomes by the new 0-10 Pre-Breakout score."""
-    reviewed = [x for x in load_signal_history() if x.get("Status") == "REVIEWED"]
-    if not reviewed:
-        return pd.DataFrame()
-
-    detail = pd.DataFrame(reviewed)
-    if "Pre-Breakout Score" not in detail.columns:
-        return pd.DataFrame()
-
-    detail["Pre-Breakout Numeric"] = pd.to_numeric(detail["Pre-Breakout Score"], errors="coerce")
-    detail = detail.dropna(subset=["Pre-Breakout Numeric"])
-    if detail.empty:
-        return pd.DataFrame()
-
-    detail["Successful"] = detail["Outcome"].isin(["SUCCESS", "STRONG SUCCESS"])
-
-    def band(v: float) -> str:
-        if v >= 9:
-            return "9-10 (Very High)"
-        if v >= 7:
-            return "7-8 (High)"
-        if v >= 5:
-            return "5-6 (Moderate)"
-        return "0-4 (Low)"
-
-    detail["Pre-Breakout Band"] = detail["Pre-Breakout Numeric"].apply(band)
-    order = ["9-10 (Very High)", "7-8 (High)", "5-6 (Moderate)", "0-4 (Low)"]
-    rows = []
-    for b in order:
-        g = detail.loc[detail["Pre-Breakout Band"] == b]
-        if g.empty:
-            continue
-        rows.append({
-            "Pre-Breakout Band": b,
-            "Reviewed": len(g),
-            "Success Rate %": 100 * g["Successful"].mean(),
-            "Avg 5-Day Return %": pd.to_numeric(g["5-Day Return %"], errors="coerce").mean(),
-            "Avg Max Gain %": pd.to_numeric(g["Max 5-Day Gain %"], errors="coerce").mean(),
-            "Avg Max Drawdown %": pd.to_numeric(g["Max 5-Day Drawdown %"], errors="coerce").mean(),
-        })
-    return pd.DataFrame(rows)
-
-
 
 def get_email_config() -> dict[str, Any]:
     """Read SMTP settings from Streamlit secrets or environment variables."""
@@ -536,37 +486,6 @@ def add_indicators(data: pd.DataFrame, settings: Settings) -> pd.DataFrame:
     df["Return_30D_Pct"] = df["Close"].pct_change(30) * 100
     df["Return_90D_Pct"] = df["Close"].pct_change(90) * 100
     df["Return_180D_Pct"] = df["Close"].pct_change(180) * 100
-
-    # --- Pre-breakout momentum indicators ---
-    # RSI(14), Wilder smoothing.
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI_14"] = 100 - (100 / (1 + rs))
-    df.loc[(avg_loss == 0) & (avg_gain > 0), "RSI_14"] = 100.0
-    df.loc[(avg_loss == 0) & (avg_gain == 0), "RSI_14"] = 50.0
-
-    # On-Balance Volume.
-    direction = np.sign(df["Close"].diff()).fillna(0.0)
-    df["OBV"] = (direction * df["Volume"]).cumsum()
-
-    # Bollinger Band Width(20, 2). Lower values indicate tighter compression.
-    bb_mid = df["Close"].rolling(20).mean()
-    bb_std = df["Close"].rolling(20).std(ddof=0)
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-    df["BB_Width"] = ((bb_upper - bb_lower) / bb_mid.replace(0, np.nan)) * 100
-    df["BB_Width_Avg_20"] = df["BB_Width"].rolling(20).mean()
-
-    # Chaikin Money Flow(20): positive values indicate accumulation.
-    hl_range = (df["High"] - df["Low"]).replace(0, np.nan)
-    money_flow_multiplier = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / hl_range
-    money_flow_volume = money_flow_multiplier.fillna(0.0) * df["Volume"]
-    volume_sum_20 = df["Volume"].rolling(20).sum().replace(0, np.nan)
-    df["CMF_20"] = money_flow_volume.rolling(20).sum() / volume_sum_20
 
     return df
 
@@ -1075,6 +994,117 @@ def evaluate_momentum_box(asset_df: pd.DataFrame, benchmark_df: pd.DataFrame | N
     return {"available": True, "score": score, "label": label, "trajectory": trajectory, "components": components, "measurements": measurements, "history": hist}
 
 
+
+def evaluate_darvas_compression(
+    asset_df: pd.DataFrame,
+    darvas_box: dict[str, Any],
+    momentum_box: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    """Score how tightly a valid Darvas base is coiling before breakout.
+
+    The 0-100 score intentionally rewards a narrow/mature box, contracting volume,
+    proximity to the upper boundary and improving momentum. It is an early-warning
+    score only; confirmed breakouts still require the normal price + volume rules.
+    """
+    if asset_df is None or asset_df.empty or not darvas_box.get("valid"):
+        return {
+            "available": False, "score": 0, "label": "N/A",
+            "direction_bias": "NEUTRAL", "distance_to_high_pct": np.nan,
+            "components": {}, "measurements": {}, "is_coiled": False,
+        }
+
+    price = safe_float(asset_df["Close"].iloc[-1])
+    box_high = safe_float(darvas_box.get("box_high"))
+    box_low = safe_float(darvas_box.get("box_low"))
+    width_pct = safe_float(darvas_box.get("box_range_pct"))
+    base_days = int(darvas_box.get("base_days", 0) or 0)
+    distance = ((box_high - price) / box_high * 100) if np.isfinite(box_high) and box_high > 0 else np.nan
+
+    # Width: up to 30 points. A box at half the configured max width gets ~15.
+    width_ratio = width_pct / max(settings.max_box_range_pct, 0.01) if np.isfinite(width_pct) else 1.0
+    width_points = 30.0 * max(0.0, min(1.0, 1.0 - width_ratio))
+
+    # Maturity: up to 15 points, fully rewarded by ~40 sessions.
+    maturity_points = 15.0 * max(0.0, min(1.0, (base_days - settings.min_base_days + 1) / max(1, 40 - settings.min_base_days + 1)))
+
+    # Volume contraction: compare the last 10 completed candles with the preceding 30.
+    completed = asset_df.iloc[:-1]
+    recent_vol = safe_float(completed["Dollar_Volume"].tail(10).mean())
+    baseline_slice = completed["Dollar_Volume"].iloc[-40:-10] if len(completed) >= 40 else completed["Dollar_Volume"].iloc[:-10]
+    baseline_vol = safe_float(baseline_slice.mean())
+    vol_ratio = recent_vol / baseline_vol if np.isfinite(baseline_vol) and baseline_vol > 0 else np.nan
+    if np.isfinite(vol_ratio):
+        volume_points = 20.0 if vol_ratio <= 0.65 else 16.0 if vol_ratio <= 0.80 else 11.0 if vol_ratio <= 0.95 else 6.0 if vol_ratio <= 1.10 else 0.0
+    else:
+        volume_points = 0.0
+
+    # Proximity to resistance: up to 20 points. Breakouts receive full credit.
+    if np.isfinite(distance):
+        proximity_points = 20.0 if distance <= 0 else 18.0 if distance <= 2 else 13.0 if distance <= 5 else 7.0 if distance <= 8 else 0.0
+    else:
+        proximity_points = 0.0
+
+    # Momentum confirmation: up to 15 points, with a small trajectory adjustment.
+    mscore = safe_float(momentum_box.get("score"), 0.0) if momentum_box.get("available") else 0.0
+    momentum_points = 15.0 * max(0.0, min(1.0, mscore / 100.0))
+    trajectory = str(momentum_box.get("trajectory", ""))
+    if "ACCELERATING" in trajectory:
+        momentum_points = min(15.0, momentum_points + 3.0)
+    elif "IMPROVING" in trajectory:
+        momentum_points = min(15.0, momentum_points + 1.5)
+    elif "DECELERATING" in trajectory:
+        momentum_points = max(0.0, momentum_points - 2.0)
+    elif "SOFTENING" in trajectory:
+        momentum_points = max(0.0, momentum_points - 1.0)
+
+    score = int(round(min(100.0, width_points + maturity_points + volume_points + proximity_points + momentum_points)))
+
+    measurements = momentum_box.get("measurements", {}) if momentum_box.get("available") else {}
+    rsi = safe_float(measurements.get("RSI (14)"))
+    macd_hist = safe_float(measurements.get("MACD histogram"))
+    if mscore >= 65 or (mscore >= 50 and ("ACCELERATING" in trajectory or "IMPROVING" in trajectory)):
+        direction = "BULLISH"
+    elif mscore < 35 or (np.isfinite(rsi) and rsi < 45 and np.isfinite(macd_hist) and macd_hist < 0):
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+
+    if darvas_box.get("confirmed_breakout"):
+        label = "BREAKOUT CONFIRMED"
+    elif score >= 70 and np.isfinite(distance) and distance <= 5:
+        label = "COILED / BREAKOUT WATCH"
+    elif score >= 70:
+        label = "COILED"
+    elif score >= 55:
+        label = "COMPRESSION BUILDING"
+    else:
+        label = "NORMAL / LOOSE BASE"
+
+    return {
+        "available": True,
+        "score": score,
+        "label": label,
+        "direction_bias": direction,
+        "distance_to_high_pct": distance,
+        "is_coiled": bool(score >= 70),
+        "components": {
+            "Box Tightness": round(width_points, 1),
+            "Box Maturity": round(maturity_points, 1),
+            "Volume Compression": round(volume_points, 1),
+            "Proximity to Box High": round(proximity_points, 1),
+            "Momentum Confirmation": round(momentum_points, 1),
+        },
+        "measurements": {
+            "Box width %": width_pct,
+            "Base days": base_days,
+            "Recent/baseline dollar-volume ratio": vol_ratio,
+            "Distance to box high %": distance,
+            "Momentum score": mscore,
+            "Momentum trajectory": trajectory or "N/A",
+        },
+    }
+
 def calculate_momentum_targets(asset_df: pd.DataFrame, momentum_box: dict[str, Any], horizon_sessions: int = 5) -> dict[str, Any]:
     """Estimate a momentum-skewed high/low price envelope over the next few sessions.
 
@@ -1139,136 +1169,6 @@ def calculate_momentum_targets(asset_df: pd.DataFrame, momentum_box: dict[str, A
         "prior_20d_high": prior20_high,
         "prior_20d_low": prior20_low,
     }
-
-def evaluate_pre_breakout_momentum(
-    asset_df: pd.DataFrame,
-    benchmark_df: pd.DataFrame | None,
-    asset_ticker: str,
-    benchmark_ticker: str,
-) -> dict[str, Any]:
-    """Score leading/pre-breakout evidence on a separate 0-10 scale.
-
-    Components:
-      Relative-strength line leadership  0-3
-      OBV accumulation                   0-2
-      Bollinger-width compression        0-2
-      RSI momentum                       0-2
-      Chaikin money flow                 0-1
-
-    This score is intentionally NOT added to the existing Overall Score yet.
-    Keeping it separate lets the 5-day validation history determine whether it
-    adds predictive value before it changes the production ranking.
-    """
-    result: dict[str, Any] = {
-        "available": False,
-        "score": 0,
-        "max_score": 10,
-        "label": "N/A",
-        "components": {},
-        "checks": {},
-    }
-    if asset_df is None or asset_df.empty or len(asset_df) < 60:
-        return result
-
-    latest = asset_df.iloc[-1]
-    components: dict[str, int] = {}
-    checks: dict[str, bool] = {}
-
-    # 1) Relative-strength line leadership: 0-3.
-    rs_points = 0
-    if benchmark_df is not None and not benchmark_df.empty and asset_ticker != benchmark_ticker:
-        aligned = pd.concat(
-            [
-                asset_df["Close"].rename("Asset"),
-                benchmark_df["Close"].rename("Benchmark"),
-            ],
-            axis=1,
-            join="inner",
-        ).dropna()
-        if len(aligned) >= 60:
-            aligned["RS_Line"] = aligned["Asset"] / aligned["Benchmark"]
-            aligned["RS_SMA_50"] = aligned["RS_Line"].rolling(50).mean()
-            aligned["RS_High_90"] = aligned["RS_Line"].rolling(90, min_periods=60).max()
-            rs_latest = aligned.iloc[-1]
-            rs_10_ago = safe_float(aligned["RS_Line"].iloc[-11]) if len(aligned) >= 11 else np.nan
-            rs_now = safe_float(rs_latest["RS_Line"])
-            rs_sma50 = safe_float(rs_latest["RS_SMA_50"])
-            rs_high90 = safe_float(rs_latest["RS_High_90"])
-
-            c1 = np.isfinite(rs_now) and np.isfinite(rs_sma50) and rs_now > rs_sma50
-            c2 = np.isfinite(rs_now) and np.isfinite(rs_high90) and rs_high90 > 0 and rs_now >= rs_high90 * 0.99
-            c3 = np.isfinite(rs_now) and np.isfinite(rs_10_ago) and rs_now > rs_10_ago
-            checks["RS line above 50-day average"] = bool(c1)
-            checks["RS line at/near 90-day high"] = bool(c2)
-            checks["RS line rising over 10 sessions"] = bool(c3)
-            rs_points = int(c1) + int(c2) + int(c3)
-    elif asset_ticker == benchmark_ticker:
-        # For the benchmark itself, use price momentum as a neutral substitute.
-        close_now = safe_float(asset_df["Close"].iloc[-1])
-        close_10 = safe_float(asset_df["Close"].iloc[-11]) if len(asset_df) >= 11 else np.nan
-        sma50 = safe_float(asset_df["SMA_50"].iloc[-1])
-        high90 = safe_float(asset_df["Close"].rolling(90, min_periods=60).max().iloc[-1])
-        c1 = np.isfinite(close_now) and np.isfinite(sma50) and close_now > sma50
-        c2 = np.isfinite(close_now) and np.isfinite(high90) and high90 > 0 and close_now >= high90 * 0.99
-        c3 = np.isfinite(close_now) and np.isfinite(close_10) and close_now > close_10
-        checks["Price above 50-day average (benchmark proxy)"] = bool(c1)
-        checks["Price at/near 90-day high (benchmark proxy)"] = bool(c2)
-        checks["Price rising over 10 sessions (benchmark proxy)"] = bool(c3)
-        rs_points = int(c1) + int(c2) + int(c3)
-    components["Relative Strength"] = rs_points
-
-    # 2) OBV accumulation: 0-2.
-    obv_now = safe_float(latest.get("OBV"))
-    obv_high50 = safe_float(asset_df["OBV"].rolling(50, min_periods=30).max().iloc[-1])
-    obv_10 = safe_float(asset_df["OBV"].iloc[-11]) if len(asset_df) >= 11 else np.nan
-    obv_high = np.isfinite(obv_now) and np.isfinite(obv_high50) and obv_now >= obv_high50 * 0.995
-    obv_rising = np.isfinite(obv_now) and np.isfinite(obv_10) and obv_now > obv_10
-    checks["OBV at/near 50-day high"] = bool(obv_high)
-    checks["OBV rising over 10 sessions"] = bool(obv_rising)
-    components["OBV"] = int(obv_high) + int(obv_rising)
-
-    # 3) Bollinger Band Width compression: 0-2.
-    bbw_now = safe_float(latest.get("BB_Width"))
-    bbw_hist = asset_df["BB_Width"].dropna().tail(126)
-    bbw_p20 = safe_float(bbw_hist.quantile(0.20)) if len(bbw_hist) >= 40 else np.nan
-    bbw_avg20 = safe_float(latest.get("BB_Width_Avg_20"))
-    bbw_compressed = np.isfinite(bbw_now) and np.isfinite(bbw_p20) and bbw_now <= bbw_p20
-    bbw_contracting = np.isfinite(bbw_now) and np.isfinite(bbw_avg20) and bbw_now < bbw_avg20
-    checks["Bollinger width in lowest 20% of 6-month range"] = bool(bbw_compressed)
-    checks["Bollinger width below its 20-day average"] = bool(bbw_contracting)
-    components["Volatility Compression"] = int(bbw_compressed) + int(bbw_contracting)
-
-    # 4) RSI momentum: 0-2. Strong but not extremely extended.
-    rsi_now = safe_float(latest.get("RSI_14"))
-    rsi_5 = safe_float(asset_df["RSI_14"].iloc[-6]) if len(asset_df) >= 6 else np.nan
-    rsi_zone = np.isfinite(rsi_now) and 50 <= rsi_now <= 80
-    rsi_rising = np.isfinite(rsi_now) and np.isfinite(rsi_5) and rsi_now > rsi_5
-    checks["RSI in 50-80 momentum zone"] = bool(rsi_zone)
-    checks["RSI rising over 5 sessions"] = bool(rsi_rising)
-    components["RSI Momentum"] = int(rsi_zone) + int(rsi_rising)
-
-    # 5) Chaikin Money Flow: 0-1.
-    cmf_now = safe_float(latest.get("CMF_20"))
-    cmf_positive = np.isfinite(cmf_now) and cmf_now > 0.05
-    checks["CMF(20) above +0.05"] = bool(cmf_positive)
-    components["Money Flow"] = int(cmf_positive)
-
-    total = int(sum(components.values()))
-    label = "VERY HIGH" if total >= 9 else "HIGH" if total >= 7 else "MODERATE" if total >= 5 else "LOW"
-    result.update({
-        "available": True,
-        "score": total,
-        "label": label,
-        "components": components,
-        "checks": checks,
-        "rsi": rsi_now,
-        "cmf": cmf_now,
-        "bb_width": bbw_now,
-        "bb_width_20th_pct": bbw_p20,
-    })
-    return result
-
-
 
 def calculate_score(
     box_result: dict[str, Any],
@@ -1941,7 +1841,22 @@ def analyze_daily_symbol(
         latest_close_gate = safe_float(asset_df["Close"].iloc[-1])
         near_20 = np.isfinite(prior_high_20) and latest_close_gate >= prior_high_20 * 0.95
         near_55 = np.isfinite(prior_high_55) and latest_close_gate >= prior_high_55 * 0.95
-        run_darvas = bool(near_20 or near_55)
+
+        # Cheap compression gate: also permit the full Darvas search when the last
+        # 20 sessions are already visibly tight and price sits in the upper half.
+        # This catches coiled bases (especially crypto) without restoring the costly
+        # exhaustive search for every symbol in the index.
+        quick_high_20 = safe_float(prior["High"].tail(20).max())
+        quick_low_20 = safe_float(prior["Low"].tail(20).min())
+        quick_mid_20 = (quick_high_20 + quick_low_20) / 2 if np.isfinite(quick_high_20) and np.isfinite(quick_low_20) else np.nan
+        quick_range_20 = ((quick_high_20 - quick_low_20) / quick_mid_20 * 100) if np.isfinite(quick_mid_20) and quick_mid_20 > 0 else np.nan
+        quick_compressed = bool(
+            np.isfinite(quick_range_20)
+            and quick_range_20 <= settings.max_box_range_pct * 1.20
+            and np.isfinite(quick_mid_20)
+            and latest_close_gate >= quick_mid_20
+        )
+        run_darvas = bool(near_20 or near_55 or quick_compressed)
 
     if run_darvas:
         darvas_box = detect_current_box(asset_df, settings)
@@ -1987,10 +1902,6 @@ def analyze_daily_symbol(
         mb_benchmark = stock_benchmark_df
 
     score = calculate_score(box, trend, dry, rs)
-    pre_breakout = evaluate_pre_breakout_momentum(
-        asset_df, mb_benchmark, ticker,
-        "BTC-USD" if ticker.endswith("-USD") else stock_benchmark_ticker,
-    )
     state = box.get("state", "NO VALID BOX")
     latest_close = safe_float(asset_df["Close"].iloc[-1])
     breakout_level = safe_float(box.get("breakout_level"))
@@ -2002,6 +1913,7 @@ def analyze_daily_symbol(
     # Momentum Box is useful across the whole universe, but batch mode avoids the
     # trajectory/history recomputation. The UI gets the full version later.
     momentum_box = evaluate_momentum_box(asset_df, mb_benchmark, include_history=not fast_batch)
+    darvas_compression = evaluate_darvas_compression(asset_df, darvas_box, momentum_box, settings)
     momentum_targets = calculate_momentum_targets(asset_df, momentum_box, horizon_sessions=5)
 
     probability = {"available": False, "probabilities": {}}
@@ -2018,12 +1930,6 @@ def analyze_daily_symbol(
         "Breakout Type": box.get("structure_type", "NONE"),
         "Price": latest_close,
         "Strategy Score": score["Total"],
-        "Pre-Breakout Score": pre_breakout.get("score", 0),
-        "Pre-Breakout Label": pre_breakout.get("label", "N/A"),
-        "Pre-Breakout Components": pre_breakout.get("components", {}),
-        "RSI": pre_breakout.get("rsi", np.nan),
-        "CMF": pre_breakout.get("cmf", np.nan),
-        "BB Width": pre_breakout.get("bb_width", np.nan),
         "Box High": safe_float(box.get("box_high")),
         "Breakout Level": breakout_level,
         "Distance to Breakout %": distance_pct,
@@ -2039,6 +1945,10 @@ def analyze_daily_symbol(
         "Momentum Low Target": safe_float(momentum_targets.get("low_target")),
         "Momentum High Upside %": safe_float(momentum_targets.get("high_upside_pct")),
         "Momentum Low Downside %": safe_float(momentum_targets.get("low_downside_pct")),
+        "Breakout Pressure": int(darvas_compression.get("score", 0)),
+        "Compression Status": darvas_compression.get("label", "N/A"),
+        "Direction Bias": darvas_compression.get("direction_bias", "NEUTRAL"),
+        "Darvas Distance to High %": safe_float(darvas_compression.get("distance_to_high_pct")),
         "Latest Date": asset_df.index[-1].strftime("%Y-%m-%d"),
     }
 
@@ -2051,6 +1961,11 @@ def send_daily_scan_email(
 ) -> None:
     confirmed = [r for r in alerts if r.get("State") == "CONFIRMED BREAKOUT"]
     watches = [r for r in alerts if r.get("State") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME"}]
+    coiled = [
+        r for r in alerts
+        if r.get("Compression Status") == "COILED / BREAKOUT WATCH"
+        and r.get("State") not in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
+    ]
 
     # High-conviction squeeze setup: strong strategy score + strong short-squeeze score.
     # Keep this as a separate ranked view; do not remove these names from the normal
@@ -2074,13 +1989,14 @@ def send_daily_scan_email(
 
     subject = (
         f"[{universe_label}] Daily breakout scan: {len(confirmed)} confirmed / "
-        f"{len(watches)} watch / {len(high_squeeze)} high-squeeze — {scan_date}"
+        f"{len(watches)} watch / {len(coiled)} coiled / {len(high_squeeze)} high-squeeze — {scan_date}"
     )
     lines = [
         f"Darvas + Minervini Daily {universe_label} + Crypto Scan — {scan_date}",
         "",
         f"Confirmed breakouts: {len(confirmed)}",
         f"Breakout watches: {len(watches)}",
+        f"Coiled pre-breakout setups: {len(coiled)}",
         f"High Squeeze + High Overall Score: {len(high_squeeze)} "
         f"(Overall >= {HIGH_OVERALL_SCORE}, Squeeze >= {HIGH_SQUEEZE_SCORE})",
         "",
@@ -2101,6 +2017,17 @@ def send_daily_scan_email(
                 f"Squeeze {safe_float(r.get('Short Squeeze Potential')):.0f}/100 "
                 f"({r.get('Short Squeeze Label','N/A')}) | SI Bonus +{r.get('Squeeze Bonus',0)} | "
                 f"5-day probability {prob_text} | Volume {safe_float(r.get('Volume Multiple')):.2f}x"
+            )
+        lines.append("")
+
+    if coiled:
+        lines += ["COILED / BREAKOUT WATCH", "=" * 60]
+        for r in sorted(coiled, key=lambda x: safe_float(x.get("Breakout Pressure"), -1), reverse=True):
+            lines.append(
+                f"{r['Ticker']} | Price {format_currency(r['Price'])} | Breakout Pressure {r.get('Breakout Pressure',0)}/100 | "
+                f"Bias {r.get('Direction Bias','NEUTRAL')} | Box High {format_currency(r.get('Box High'))} | "
+                f"Distance {safe_float(r.get('Darvas Distance to High %')):.2f}% | "
+                f"Momentum {r.get('Momentum Box Score',0)}/100 ({r.get('Momentum Box Trajectory','N/A')})"
             )
         lines.append("")
 
@@ -2209,7 +2136,14 @@ def run_daily_market_scan(
         except Exception as exc:
             errors.append({"Ticker": ticker, "Error": str(exc)[:180]})
 
-    alerts = [r for r in results if r.get("State") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}]
+    alerts = [
+        r for r in results
+        if r.get("State") in {"BREAKOUT WATCH", "PRICE BREAKOUT / WEAK VOLUME", "CONFIRMED BREAKOUT"}
+        or (
+            safe_float(r.get("Breakout Pressure"), 0) >= 70
+            and safe_float(r.get("Darvas Distance to High %"), 999) <= 5
+        )
+    ]
 
     # Stage 2 enrichment runs only for actionable candidates. Historical analog
     # probability, target construction and short-interest fundamentals are much
@@ -2222,27 +2156,17 @@ def run_daily_market_scan(
         if asset_df is not None and not asset_df.empty:
             # Reconstruct only what the expensive enrichment needs.
             if r.get("State") == "BREAKOUT WATCH":
-                core_for_probability = int(r.get("Strategy Score", 0))
-                if core_for_probability >= MIN_WATCH_SCORE_FOR_PROBABILITY:
-                    if r.get("Breakout Type") == "MOMENTUM":
-                        current_structure = detect_momentum_breakout(asset_df, settings)
-                    else:
-                        current_structure = detect_current_box(asset_df, settings)
-                    current_trend = evaluate_trend_template(asset_df, settings)
-                    current_dry = evaluate_volume_dry_up(asset_df, settings)
-                    prob = estimate_breakout_probability(
-                        asset_df, settings, current_structure, current_trend, current_dry
-                    )
-                    r["5-Day Probability %"] = prob.get("probabilities", {}).get(5, np.nan)
-                    r["Probability Confidence"] = prob.get("confidence", "N/A") if prob.get("available") else "N/A"
-                    r["Probability Status"] = "Calculated" if prob.get("available") else prob.get("reason", "Not available")
+                if r.get("Breakout Type") == "MOMENTUM":
+                    current_structure = detect_momentum_breakout(asset_df, settings)
                 else:
-                    r["5-Day Probability %"] = np.nan
-                    r["Probability Confidence"] = "N/A"
-                    r["Probability Status"] = (
-                        f"Skipped for speed: Core Score {core_for_probability}/100 is below "
-                        f"{MIN_WATCH_SCORE_FOR_PROBABILITY}"
-                    )
+                    current_structure = detect_current_box(asset_df, settings)
+                current_trend = evaluate_trend_template(asset_df, settings)
+                current_dry = evaluate_volume_dry_up(asset_df, settings)
+                prob = estimate_breakout_probability(
+                    asset_df, settings, current_structure, current_trend, current_dry
+                )
+                r["5-Day Probability %"] = prob.get("probabilities", {}).get(5, np.nan)
+                r["Probability Confidence"] = prob.get("confidence", "N/A") if prob.get("available") else "N/A"
 
             if r.get("Breakout Type") == "MOMENTUM":
                 target_structure = detect_momentum_breakout(asset_df, settings)
@@ -2303,111 +2227,6 @@ def run_daily_market_scan(
         "email_error": email_error,
         "signals_added": signals_added,
         "signals_reviewed": reviewed_now,
-    }
-
-
-
-
-def run_short_squeeze_scan(
-    scan_mode: str = "sp500",
-    threshold: float = 70.0,
-    progress_callback=None,
-    max_workers: int = 6,
-) -> dict[str, Any]:
-    """Scan one stock universe specifically for high short-squeeze potential.
-
-    OHLCV is downloaded in 50-symbol batches. Short-interest fundamentals require
-    per-ticker Yahoo lookups, so those calls are parallelized conservatively.
-    This scan is independent of Darvas state: a stock does not need to be on
-    BREAKOUT WATCH to appear here.
-    """
-    mode = normalize_scan_mode(scan_mode)
-    label = "NASDAQ-100" if mode == "nasdaq100" else "S&P 500"
-    stock_symbols = get_nasdaq100_tickers() if mode == "nasdaq100" else get_sp500_tickers()
-
-    # No crypto/ETF symbols: the short-squeeze model is stock-specific.
-    stock_symbols = list(dict.fromkeys(stock_symbols))
-    market_data = download_market_data_batch(
-        tuple(stock_symbols),
-        default_daily_settings().history_period,
-        chunk_size=50,
-    )
-
-    rows: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-    total = len(stock_symbols)
-    completed = 0
-
-    def _one(ticker: str) -> tuple[str, dict[str, Any]]:
-        raw = market_data.get(ticker)
-        if raw is None or raw.empty:
-            return ticker, {"available": False, "error": "No market data"}
-        sq = fetch_short_squeeze_snapshot(ticker, raw)
-        return ticker, sq
-
-    # Conservative parallelism reduces runtime without hammering Yahoo too hard.
-    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
-        futures = {pool.submit(_one, ticker): ticker for ticker in stock_symbols}
-        for future in as_completed(futures):
-            ticker = futures[future]
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total, ticker)
-            try:
-                _, sq = future.result()
-            except Exception as exc:
-                errors.append({"Ticker": ticker, "Error": str(exc)[:180]})
-                continue
-
-            if not sq.get("available"):
-                if sq.get("error"):
-                    errors.append({"Ticker": ticker, "Error": str(sq.get("error"))[:180]})
-                continue
-
-            score = safe_float(sq.get("score"))
-            if not np.isfinite(score) or score < threshold:
-                continue
-
-            raw = market_data.get(ticker)
-            latest_price = safe_float(raw["Close"].iloc[-1]) if raw is not None and not raw.empty else np.nan
-            return_20d = np.nan
-            if raw is not None and len(raw) >= 21:
-                p0 = safe_float(raw["Close"].iloc[-21])
-                p1 = safe_float(raw["Close"].iloc[-1])
-                if np.isfinite(p0) and p0 > 0 and np.isfinite(p1):
-                    return_20d = (p1 / p0 - 1) * 100
-
-            rows.append({
-                "Ticker": ticker,
-                "Price": latest_price,
-                "Squeeze Score": score,
-                "Squeeze Label": sq.get("label", "N/A"),
-                "Short % Float": (
-                    safe_float(sq.get("short_percent_float")) * 100
-                    if np.isfinite(safe_float(sq.get("short_percent_float")))
-                    else np.nan
-                ),
-                "Days to Cover": safe_float(sq.get("days_to_cover")),
-                "Short Interest Change %": safe_float(sq.get("short_change_pct")),
-                "Relative Volume": safe_float(sq.get("relative_volume")),
-                "20-Day Return %": return_20d,
-            })
-
-    rows.sort(
-        key=lambda r: (
-            safe_float(r.get("Squeeze Score"), -1),
-            safe_float(r.get("Short % Float"), -1),
-            safe_float(r.get("Days to Cover"), -1),
-        ),
-        reverse=True,
-    )
-
-    return {
-        "universe": label,
-        "universe_count": total,
-        "threshold": threshold,
-        "candidates": rows,
-        "errors": errors,
     }
 
 
@@ -2649,104 +2468,19 @@ def main() -> None:
         f"?scan={ACTIVE_SCAN_MODE}" + ("&autorun=1" if AUTO_RUN_DAILY_SCAN else ""),
         language=None,
     )
-    scan_col1, scan_col2, scan_col3 = st.columns(3)
-    with scan_col1:
-        run_sp500_now = st.button(
-            "Run Full S&P 500 Scan Now", type="primary", use_container_width=True
+    daily_left, daily_right = st.columns([1, 3])
+    with daily_left:
+        run_daily_now = st.button(
+            f"Run full {ACTIVE_SCAN_LABEL} scan now", type="primary", use_container_width=True
         )
-    with scan_col2:
-        run_nasdaq100_now = st.button(
-            "Run Full Nasdaq 100 Scan Now", type="primary", use_container_width=True
-        )
-    with scan_col3:
-        run_squeeze_now = st.button(
-            "🔥 Scan Short Squeeze Candidates", use_container_width=True
-        )
+    with daily_right:
+        st.caption("For unattended once-daily execution, use the included GitHub Actions workflow / daily_scan.py runner.")
 
-    st.caption(
-        "Short Squeeze scan uses the URL-selected universe "
-        f"({ACTIVE_SCAN_LABEL}) and is independent of Darvas breakout state. "
-        "For unattended once-daily breakout execution, use the GitHub Actions workflow / daily_scan.py runner."
-    )
-
-    if run_squeeze_now:
-        squeeze_threshold = 70.0
-        squeeze_progress = st.progress(
-            0.0,
-            text=f"Starting {ACTIVE_SCAN_LABEL} short-squeeze scan..."
-        )
-
-        def _update_squeeze_progress(done: int, total: int, symbol: str) -> None:
-            squeeze_progress.progress(
-                min(done / max(total, 1), 1.0),
-                text=f"Evaluating short squeeze: {symbol} ({done}/{total})",
-            )
-
-        try:
-            squeeze_result = run_short_squeeze_scan(
-                scan_mode=ACTIVE_SCAN_MODE,
-                threshold=squeeze_threshold,
-                progress_callback=_update_squeeze_progress,
-                max_workers=6,
-            )
-            squeeze_progress.progress(1.0, text="Short-squeeze scan complete")
-            squeeze_candidates = squeeze_result.get("candidates", [])
-
-            st.markdown(f"## 🔥 {ACTIVE_SCAN_LABEL} Short Squeeze Potential")
-            st.caption(
-                f"Candidates with Short Squeeze Potential >= {squeeze_threshold:.0f}/100. "
-                "This scan does not require a Darvas or Momentum breakout setup."
-            )
-
-            if squeeze_candidates:
-                squeeze_df = pd.DataFrame(squeeze_candidates)
-                st.dataframe(
-                    squeeze_df.style.format({
-                        "Price": "${:,.2f}",
-                        "Squeeze Score": "{:.1f}",
-                        "Short % Float": "{:.1f}%",
-                        "Days to Cover": "{:.2f}",
-                        "Short Interest Change %": "{:+.1f}%",
-                        "Relative Volume": "{:.2f}x",
-                        "20-Day Return %": "{:+.1f}%",
-                    }),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-                st.success(
-                    f"Found {len(squeeze_candidates)} high-squeeze candidate(s) "
-                    f"from {squeeze_result.get('universe_count', 0)} {ACTIVE_SCAN_LABEL} securities."
-                )
-            else:
-                st.info(
-                    f"No {ACTIVE_SCAN_LABEL} stocks currently have a Short Squeeze Potential "
-                    f"score of {squeeze_threshold:.0f}/100 or higher."
-                )
-
-            if squeeze_result.get("errors"):
-                with st.expander(f"Squeeze scan warnings ({len(squeeze_result['errors'])})"):
-                    st.dataframe(
-                        pd.DataFrame(squeeze_result["errors"]),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-        except Exception as exc:
-            st.error(f"Short-squeeze scan failed: {exc}")
-
-    # Manual buttons explicitly choose their universe. autorun=1 continues to use
-    # the URL-selected ACTIVE_SCAN_MODE.
-    manual_scan_mode = (
-        "sp500" if run_sp500_now
-        else "nasdaq100" if run_nasdaq100_now
-        else None
-    )
-    run_daily_now = manual_scan_mode is not None
-    requested_scan_mode = manual_scan_mode or ACTIVE_SCAN_MODE
-    requested_scan_label = "NASDAQ-100" if requested_scan_mode == "nasdaq100" else "S&P 500"
-
+    # autorun=1 is useful for an automation/browser session. The normal daily-state
+    # guard prevents repeated emails on Streamlit reruns unless the manual button is used.
     should_run_daily = run_daily_now or AUTO_RUN_DAILY_SCAN
     if should_run_daily:
-        progress = st.progress(0.0, text=f"Starting {requested_scan_label} daily market scan...")
+        progress = st.progress(0.0, text=f"Starting {ACTIVE_SCAN_LABEL} daily market scan...")
         def _update_progress(done: int, total: int, symbol: str) -> None:
             progress.progress(min(done / max(total, 1), 1.0), text=f"Scanning {symbol} ({done}/{total})")
         try:
@@ -2755,7 +2489,7 @@ def main() -> None:
                 send_email=True,
                 force=bool(run_daily_now),
                 progress_callback=_update_progress,
-                scan_mode=requested_scan_mode,
+                scan_mode=ACTIVE_SCAN_MODE,
             )
             progress.progress(1.0, text="Daily scan complete")
             if daily_result.get("skipped"):
@@ -2763,9 +2497,11 @@ def main() -> None:
             alerts = daily_result.get("alerts", [])
             confirmed = sum(1 for r in alerts if r.get("State") == "CONFIRMED BREAKOUT")
             watches = sum(1 for r in alerts if r.get("State") == "BREAKOUT WATCH")
+            coiled_count = sum(1 for r in alerts if r.get("Compression Status") == "COILED / BREAKOUT WATCH")
             st.success(
                 f"Scanned {daily_result.get('analyzed_count', 0)} symbols: "
-                f"{confirmed} confirmed breakout(s), {watches} breakout watch(es)."
+                f"{confirmed} confirmed breakout(s), {watches} breakout watch(es), "
+                f"{coiled_count} coiled/high-pressure setup(s)."
             )
             if daily_result.get("email_sent"):
                 st.success("Daily alert digest email sent.")
@@ -2788,6 +2524,9 @@ def main() -> None:
                         "Volume x": r.get("Volume Multiple"),
                         "5-Day Prob. %": r.get("5-Day Probability %"),
                         "Momentum Box": r.get("Momentum Box Score"),
+                        "Breakout Pressure": r.get("Breakout Pressure"),
+                        "Compression": r.get("Compression Status"),
+                        "Bias": r.get("Direction Bias"),
                         "Momentum High": r.get("Momentum High Target"),
                         "Momentum Low": r.get("Momentum Low Target"),
                     }
@@ -2833,6 +2572,18 @@ def main() -> None:
                     )
                 else:
                     st.info("No current alerts meet both high-score/high-squeeze thresholds.")
+
+                coiled_rows = sorted(
+                    [r for r in alerts if r.get("Compression Status") == "COILED / BREAKOUT WATCH"],
+                    key=lambda x: safe_float(x.get("Breakout Pressure"), -1),
+                    reverse=True,
+                )
+                st.markdown("### ⚡ Coiled / Breakout Watch")
+                st.caption("Tight Darvas bases near resistance, ranked by Breakout Pressure. These are early-warning setups and may not yet satisfy the normal breakout-watch rule.")
+                if coiled_rows:
+                    st.dataframe(pd.DataFrame([_alert_row(r) for r in coiled_rows]), hide_index=True, use_container_width=True)
+                else:
+                    st.info("No high-pressure coiled Darvas setups in this scan.")
 
                 st.markdown("### ✅ Confirmed Breakouts")
                 if confirmed_rows:
@@ -2890,27 +2641,9 @@ def main() -> None:
             }), hide_index=True, use_container_width=True
         )
 
-        prebreak_accuracy = pre_breakout_accuracy_frame()
-        if not prebreak_accuracy.empty:
-            st.markdown("#### Accuracy by Pre-Breakout Momentum Score")
-            st.caption(
-                "Use this table to decide later whether the 0-10 leading-indicator score "
-                "deserves weight in Overall Score."
-            )
-            st.dataframe(
-                prebreak_accuracy.style.format({
-                    "Success Rate %": "{:.1f}%",
-                    "Avg 5-Day Return %": "{:+.2f}%",
-                    "Avg Max Gain %": "{:+.2f}%",
-                    "Avg Max Drawdown %": "{:+.2f}%",
-                }),
-                hide_index=True,
-                use_container_width=True,
-            )
-
         with st.expander("Reviewed signal history"):
             cols = [c for c in [
-                "Ticker", "Signal Date", "Signal Type", "Signal Price", "Overall Score", "Score Band", "Pre-Breakout Score",
+                "Ticker", "Signal Date", "Signal Type", "Signal Price", "Overall Score", "Score Band",
                 "Review Date", "Day 5 Price", "5-Day Return %", "Max 5-Day Gain %",
                 "Max 5-Day Drawdown %", "Held Breakout", "Outcome"
             ] if c in accuracy_detail.columns]
@@ -2965,33 +2698,16 @@ def main() -> None:
     dry_up_result = evaluate_volume_dry_up(asset_df, settings)
     rs_result = evaluate_relative_strength(ticker, asset_df, btc_df)
     momentum_box = evaluate_momentum_box(asset_df, momentum_benchmark_df)
+    darvas_compression = evaluate_darvas_compression(asset_df, darvas_result, momentum_box, settings)
     momentum_targets = calculate_momentum_targets(asset_df, momentum_box, horizon_sessions=5)
     core_score = calculate_score(box_result, trend_result, dry_up_result, rs_result)
-    pre_breakout = evaluate_pre_breakout_momentum(
-        asset_df,
-        momentum_benchmark_df,
-        ticker,
-        "BTC-USD" if ticker.endswith("-USD") else ACTIVE_BENCHMARK,
-    )
     squeeze_snapshot = fetch_short_squeeze_snapshot(ticker, asset_df)
     score = calculate_score_with_squeeze(core_score, squeeze_snapshot)
 
     breakout_probability = (
         estimate_breakout_probability(asset_df, settings, box_result, trend_result, dry_up_result)
-        if (
-            box_result.get("state") == "BREAKOUT WATCH"
-            and core_score["Total"] >= MIN_WATCH_SCORE_FOR_PROBABILITY
-        )
-        else {
-            "available": False,
-            "probabilities": {},
-            "reason": (
-                f"Skipped for speed: Core Score {core_score['Total']}/100 is below "
-                f"{MIN_WATCH_SCORE_FOR_PROBABILITY}"
-                if box_result.get("state") == "BREAKOUT WATCH"
-                else "Current state is not BREAKOUT WATCH"
-            ),
-        }
+        if box_result.get("state") == "BREAKOUT WATCH"
+        else {"available": False, "probabilities": {}}
     )
     breakout_targets = (
         calculate_breakout_targets(asset_df, box_result)
@@ -3024,43 +2740,43 @@ def main() -> None:
         "Crypto daily candles from the data source may still be incomplete before the UTC day closes."
     )
 
-    metric_columns = st.columns(10)
+    metric_columns = st.columns(12)
     metric_columns[0].metric("Price", format_currency(latest["Close"]), f"{daily_change:.2f}%")
     metric_columns[1].metric("Overall Score", f"{score['Total']}/100")
     metric_columns[2].metric("Momentum Box", f"{momentum_box.get('score',0)}/100", momentum_box.get('trajectory','N/A'))
     metric_columns[4].metric("Core Score", f"{score['Core Total']}/100")
     sq_display = safe_float(squeeze_snapshot.get("score"))
     metric_columns[3].metric(
-        "Pre-Breakout",
-        f"{pre_breakout.get('score', 0)}/10",
-        pre_breakout.get("label", "N/A"),
+        "Short Squeeze",
+        f"{sq_display:.0f}/100" if np.isfinite(sq_display) else "N/A",
+        f"+{score['Short Squeeze Bonus']} bonus" if score['Short Squeeze Bonus'] else None,
     )
-    # Short squeeze is still shown in the dedicated panel/tab below.
-
     metric_columns[5].metric("State", box_result.get("state", "N/A"))
-    metric_columns[6].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
-    metric_columns[7].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
-    metric_columns[8].metric(
+    metric_columns[6].metric("Breakout Pressure", f"{darvas_compression.get('score',0)}/100", darvas_compression.get('label','N/A'))
+    metric_columns[7].metric("Direction Bias", darvas_compression.get("direction_bias", "NEUTRAL"))
+    metric_columns[8].metric("Box High", format_currency(safe_float(box_result.get("box_high"))))
+    metric_columns[9].metric("Box Low", format_currency(safe_float(box_result.get("box_low"))))
+    metric_columns[10].metric(
         "Breakout Volume",
         f"{safe_float(box_result.get('volume_multiple')):.2f}×"
         if np.isfinite(safe_float(box_result.get("volume_multiple")))
         else "N/A",
     )
     if breakout_probability.get("available"):
-        metric_columns[9].metric(
+        metric_columns[11].metric(
             "5-Day Breakout Prob.",
             f"{breakout_probability['probabilities'].get(5, np.nan):.0f}%",
             breakout_probability.get("confidence", ""),
         )
     elif breakout_targets.get("available"):
         first_target = breakout_targets["targets"][0]
-        metric_columns[8].metric(
+        metric_columns[10].metric(
             "Nearest Target",
             format_currency(first_target["price"]),
             f"{first_target['upside_from_price_pct']:+.1f}%",
         )
     else:
-        metric_columns[8].metric("Forecast", "N/A")
+        metric_columns[10].metric("Forecast", "N/A")
 
     tabs = st.tabs(
         [
@@ -3070,8 +2786,8 @@ def main() -> None:
             "Volume Dry-Up",
             "Relative Strength",
             "Breakout Forecast",
-            "Pre-Breakout",
             "Momentum Box",
+            "Darvas Compression",
             "Raw Data",
         ]
     )
@@ -3393,31 +3109,6 @@ def main() -> None:
             st.info("Forecast outputs appear when the state is BREAKOUT WATCH or a price/confirmed breakout is detected.")
 
     with tabs[6]:
-        st.subheader("Pre-Breakout Momentum")
-        st.caption(
-            "Separate 0-10 leading-indicator score. It remains outside Overall Score "
-            "until the 5-day validation history shows whether it improves prediction."
-        )
-        pb_components = pre_breakout.get("components", {})
-        pb1, pb2, pb3, pb4, pb5 = st.columns(5)
-        pb1.metric("RS Leadership", f"{pb_components.get('Relative Strength', 0)}/3")
-        pb2.metric("OBV", f"{pb_components.get('OBV', 0)}/2")
-        pb3.metric("Compression", f"{pb_components.get('Volatility Compression', 0)}/2")
-        pb4.metric("RSI Momentum", f"{pb_components.get('RSI Momentum', 0)}/2")
-        pb5.metric("Money Flow", f"{pb_components.get('Money Flow', 0)}/1")
-
-        detail_rows = [
-            {"Measure": "Pre-Breakout Score", "Value": f"{pre_breakout.get('score', 0)}/10"},
-            {"Measure": "Signal Band", "Value": pre_breakout.get("label", "N/A")},
-            {"Measure": "RSI(14)", "Value": f"{safe_float(pre_breakout.get('rsi')):.1f}" if np.isfinite(safe_float(pre_breakout.get('rsi'))) else "N/A"},
-            {"Measure": "CMF(20)", "Value": f"{safe_float(pre_breakout.get('cmf')):.3f}" if np.isfinite(safe_float(pre_breakout.get('cmf'))) else "N/A"},
-            {"Measure": "Bollinger Width", "Value": f"{safe_float(pre_breakout.get('bb_width')):.2f}%" if np.isfinite(safe_float(pre_breakout.get('bb_width'))) else "N/A"},
-        ]
-        st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
-        for label, passed in pre_breakout.get("checks", {}).items():
-            st.write(f"{'✅' if passed else '❌'} {label}")
-
-    with tabs[7]:
         st.subheader("Momentum Box")
         if not momentum_box.get("available"):
             st.info("Momentum Box requires at least 60 daily candles.")
@@ -3488,6 +3179,38 @@ def main() -> None:
                 st.dataframe(hist_df, hide_index=True, use_container_width=True)
                 st.line_chart(hist_df.set_index("Date")["Score"])
 
+    with tabs[7]:
+        st.subheader("Darvas Compression / Breakout Pressure")
+        if not darvas_compression.get("available"):
+            st.info("A valid Darvas box is required before compression pressure can be scored.")
+        else:
+            dc1, dc2, dc3 = st.columns(3)
+            dc1.metric("Breakout Pressure", f"{darvas_compression['score']}/100")
+            dc2.metric("Status", darvas_compression["label"])
+            dc3.metric("Direction Bias", darvas_compression["direction_bias"])
+
+            if darvas_compression["label"] == "COILED / BREAKOUT WATCH":
+                st.warning("⚡ COILED / BREAKOUT WATCH — the Darvas box is tight and mature, price is close to resistance, and pressure is elevated. This is an early-warning state, not a confirmed breakout.")
+            elif darvas_compression["label"] == "COILED":
+                st.info("The base is tightly compressed, but price is not yet close enough to the box high for breakout-watch status.")
+            elif darvas_compression["label"] == "COMPRESSION BUILDING":
+                st.info("Compression is developing, but the setup has not reached the coiled threshold.")
+
+            comp_df = pd.DataFrame([
+                {"Component": k, "Points": v, "Max": {"Box Tightness":30, "Box Maturity":15, "Volume Compression":20, "Proximity to Box High":20, "Momentum Confirmation":15}.get(k, 0)}
+                for k, v in darvas_compression.get("components", {}).items()
+            ])
+            st.markdown("#### Pressure Components")
+            st.dataframe(comp_df, hide_index=True, use_container_width=True)
+
+            measure_df = pd.DataFrame([
+                {"Measure": k, "Value": (f"{v:.2f}" if isinstance(v, (int, float, np.integer, np.floating)) and np.isfinite(safe_float(v)) else str(v))}
+                for k, v in darvas_compression.get("measurements", {}).items()
+            ])
+            st.markdown("#### Compression Measurements")
+            st.dataframe(measure_df, hide_index=True, use_container_width=True)
+            st.caption("Breakout Pressure combines box tightness, box maturity, volume contraction, proximity to the Darvas high and Momentum Box confirmation. A high score anticipates expansion risk; direction still depends on momentum and the actual breakout.")
+
     with tabs[8]:
         display_columns = [
             "Open",
@@ -3500,10 +3223,6 @@ def main() -> None:
             "SMA_150",
             "SMA_200",
             "ATR_Pct",
-            "RSI_14",
-            "OBV",
-            "BB_Width",
-            "CMF_20",
             "Distance_From_365D_High_Pct",
         ]
         export = asset_df[display_columns].copy().sort_index(ascending=False)
