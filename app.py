@@ -1997,6 +1997,215 @@ def get_scan_universe(scan_mode: str) -> tuple[list[str], str, str]:
     return get_sp500_tickers(), "SPY", "S&P 500"
 
 
+# --- S&P 500 macro/sector overlay -------------------------------------------------
+# Positive sensitivity means rising long rates are generally a headwind for the
+# sector. A small negative value means rising rates can be modestly supportive.
+SECTOR_ETF_MAP: dict[str, str] = {
+    "Communication Services": "XLC",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Financials": "XLF",
+    "Health Care": "XLV",
+    "Industrials": "XLI",
+    "Information Technology": "XLK",
+    "Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+}
+
+SECTOR_RATE_SENSITIVITY: dict[str, float] = {
+    "Information Technology": 1.00,
+    "Real Estate": 1.00,
+    "Utilities": 0.90,
+    "Consumer Discretionary": 0.75,
+    "Communication Services": 0.65,
+    "Health Care": 0.35,
+    "Industrials": 0.35,
+    "Materials": 0.25,
+    "Consumer Staples": 0.20,
+    "Energy": 0.10,
+    "Financials": -0.25,
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sp500_sector_map() -> dict[str, str]:
+    """Map S&P 500 Yahoo symbols to GICS sectors using the constituent source."""
+    urls = [
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+    ]
+    for url in urls:
+        try:
+            table = pd.read_csv(url)
+            symbol_col = next((c for c in table.columns if str(c).strip().lower() in {"symbol", "ticker"}), None)
+            sector_col = next((c for c in table.columns if str(c).strip().lower() in {"gics sector", "sector"}), None)
+            if symbol_col and sector_col:
+                mapping = {
+                    str(row[symbol_col]).strip().upper().replace(".", "-"): str(row[sector_col]).strip()
+                    for _, row in table[[symbol_col, sector_col]].dropna().iterrows()
+                }
+                if len(mapping) >= 450:
+                    return mapping
+        except Exception:
+            pass
+
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        for table in tables:
+            symbol_col = next((c for c in table.columns if str(c).strip().lower() in {"symbol", "ticker symbol"}), None)
+            sector_col = next((c for c in table.columns if str(c).strip().lower() in {"gics sector", "sector"}), None)
+            if symbol_col and sector_col:
+                mapping = {
+                    str(row[symbol_col]).strip().upper().replace(".", "-"): str(row[sector_col]).strip()
+                    for _, row in table[[symbol_col, sector_col]].dropna().iterrows()
+                }
+                if len(mapping) >= 450:
+                    return mapping
+        
+    except Exception:
+        pass
+    return {}
+
+
+def _yield_percent_from_index(value: float) -> float:
+    """Normalize Yahoo yield-index quotes to a percentage yield when possible."""
+    v = safe_float(value)
+    if not np.isfinite(v):
+        return np.nan
+    # Some yield indices historically quote 10x the percentage; others quote the
+    # percentage directly. This keeps the calculation robust to either convention.
+    return v / 10.0 if v > 20 else v
+
+
+def evaluate_macro_sector_snapshot() -> dict[str, Any]:
+    """Fetch one macro/sector batch and derive a reusable S&P sector regime.
+
+    The expensive market-data call happens once per scan. Per-stock macro scores are
+    then pure local arithmetic based on the stock's GICS sector.
+    """
+    symbols = ["^TNX", "^IRX", "SPY"] + list(SECTOR_ETF_MAP.values())
+    try:
+        data = download_market_data_batch(tuple(dict.fromkeys(symbols)), "6mo", chunk_size=50)
+    except Exception as exc:
+        return {"available": False, "reason": f"Macro batch download failed: {exc}"}
+
+    tnx = data.get("^TNX")
+    spy = data.get("SPY")
+    if tnx is None or tnx.empty or spy is None or spy.empty or len(tnx) < 21 or len(spy) < 21:
+        return {"available": False, "reason": "10Y Treasury and/or SPY macro history unavailable"}
+
+    y10_now = _yield_percent_from_index(tnx["Close"].iloc[-1])
+    y10_5 = _yield_percent_from_index(tnx["Close"].iloc[-6]) if len(tnx) >= 6 else np.nan
+    y10_20 = _yield_percent_from_index(tnx["Close"].iloc[-21])
+    change_5_bps = (y10_now - y10_5) * 100 if np.isfinite(y10_5) else np.nan
+    change_20_bps = (y10_now - y10_20) * 100 if np.isfinite(y10_20) else np.nan
+
+    # Positive rate_pressure = rising yields/headwind; negative = falling/tailwind.
+    p5 = 0.0 if not np.isfinite(change_5_bps) else max(-100.0, min(100.0, change_5_bps / 10.0 * 100.0))
+    p20 = 0.0 if not np.isfinite(change_20_bps) else max(-100.0, min(100.0, change_20_bps / 25.0 * 100.0))
+    rate_pressure = max(-100.0, min(100.0, 0.35 * p5 + 0.65 * p20))
+
+    if rate_pressure >= 60:
+        regime = "STRONG RATE HEADWIND"
+    elif rate_pressure >= 25:
+        regime = "RATE HEADWIND"
+    elif rate_pressure <= -60:
+        regime = "STRONG RATE TAILWIND"
+    elif rate_pressure <= -25:
+        regime = "RATE TAILWIND"
+    else:
+        regime = "RATE NEUTRAL"
+
+    spy_ret20 = (safe_float(spy["Close"].iloc[-1]) / safe_float(spy["Close"].iloc[-21]) - 1.0) * 100.0
+    sector_rows: dict[str, dict[str, Any]] = {}
+    for sector, etf in SECTOR_ETF_MAP.items():
+        frame = data.get(etf)
+        if frame is None or frame.empty or len(frame) < 21:
+            sector_rows[sector] = {
+                "sector": sector,
+                "etf": etf,
+                "available": False,
+                "macro_score": 50.0,
+                "label": "NEUTRAL / DATA UNAVAILABLE",
+            }
+            continue
+        sector_ret20 = (safe_float(frame["Close"].iloc[-1]) / safe_float(frame["Close"].iloc[-21]) - 1.0) * 100.0
+        rel20 = sector_ret20 - spy_ret20
+        sensitivity = SECTOR_RATE_SENSITIVITY.get(sector, 0.35)
+
+        # Rate component can move the sector macro score by roughly +/-30 points.
+        # Relative sector leadership can add/subtract up to 20 points.
+        rate_component = -0.30 * rate_pressure * sensitivity
+        relative_component = max(-20.0, min(20.0, rel20 * 2.0))
+        macro_score = max(0.0, min(100.0, 50.0 + rate_component + relative_component))
+        if macro_score >= 65:
+            label = "TAILWIND"
+        elif macro_score <= 35:
+            label = "HEADWIND"
+        else:
+            label = "NEUTRAL"
+        sector_rows[sector] = {
+            "sector": sector,
+            "etf": etf,
+            "available": True,
+            "macro_score": round(macro_score, 1),
+            "label": label,
+            "rate_sensitivity": sensitivity,
+            "sector_20d_return_pct": sector_ret20,
+            "relative_to_spy_20d_pct": rel20,
+        }
+
+    irx = data.get("^IRX")
+    y3m = np.nan
+    curve_bps = np.nan
+    if irx is not None and not irx.empty:
+        y3m = _yield_percent_from_index(irx["Close"].iloc[-1])
+        if np.isfinite(y10_now) and np.isfinite(y3m):
+            curve_bps = (y10_now - y3m) * 100.0
+
+    return {
+        "available": True,
+        "regime": regime,
+        "rate_pressure": round(rate_pressure, 1),
+        "ten_year_yield_pct": y10_now,
+        "ten_year_change_5d_bps": change_5_bps,
+        "ten_year_change_20d_bps": change_20_bps,
+        "three_month_yield_pct": y3m,
+        "curve_10y_3m_bps": curve_bps,
+        "spy_20d_return_pct": spy_ret20,
+        "sectors": sector_rows,
+    }
+
+
+def apply_sector_macro_overlay(
+    row: dict[str, Any],
+    sector_map: dict[str, str],
+    macro_snapshot: dict[str, Any],
+) -> None:
+    """Add macro metadata without changing the existing technical Strategy Score."""
+    ticker = str(row.get("Ticker", ""))
+    technical = safe_float(row.get("Strategy Score"))
+    sector = sector_map.get(ticker, "N/A")
+    row["Sector"] = sector
+    row["Macro Regime"] = macro_snapshot.get("regime", "N/A") if macro_snapshot.get("available") else "N/A"
+
+    sector_data = macro_snapshot.get("sectors", {}).get(sector, {}) if macro_snapshot.get("available") else {}
+    if sector == "N/A" or not sector_data:
+        row["Sector Macro Score"] = np.nan
+        row["Sector Macro Label"] = "N/A"
+        row["Macro-Adjusted Score"] = technical
+        return
+
+    macro_score = safe_float(sector_data.get("macro_score"), 50.0)
+    row["Sector Macro Score"] = macro_score
+    row["Sector Macro Label"] = sector_data.get("label", "NEUTRAL")
+    row["Sector ETF"] = sector_data.get("etf", "")
+    row["Sector vs SPY 20D %"] = safe_float(sector_data.get("relative_to_spy_20d_pct"))
+    # Technical signal remains dominant; macro contributes 15% of the combined view.
+    row["Macro-Adjusted Score"] = round(max(0.0, min(100.0, 0.85 * technical + 0.15 * macro_score)), 1)
+
+
 def normalize_download_frame(data: pd.DataFrame) -> pd.DataFrame:
     if data is None or data.empty:
         return pd.DataFrame()
@@ -2569,6 +2778,17 @@ def run_daily_market_scan(
         r["Dual Coiled Bullish"] = flags["dual"]
         r["Squeeze + Momentum Compression"] = flags["squeeze_momentum"]
 
+    # S&P-only macro overlay. Fetch macro/sector data once, then reuse locally for every stock.
+    macro_snapshot: dict[str, Any] = {"available": False, "reason": "Macro overlay is enabled for S&P 500 scans only."}
+    if scan_mode == "sp500":
+        try:
+            macro_snapshot = evaluate_macro_sector_snapshot()
+            sector_map = get_sp500_sector_map()
+            for row in results:
+                apply_sector_macro_overlay(row, sector_map, macro_snapshot)
+        except Exception as exc:
+            macro_snapshot = {"available": False, "reason": str(exc)}
+
     # First grade older signals with today's downloaded candles, then store today's signals.
     reviewed_now = review_mature_signals(market_data, sessions=5)
     signals_added = record_new_signals(alerts)
@@ -2612,6 +2832,7 @@ def run_daily_market_scan(
         "email_error": email_error,
         "signals_added": signals_added,
         "signals_reviewed": reviewed_now,
+        "macro_snapshot": macro_snapshot,
     }
 
 
@@ -3080,6 +3301,42 @@ def main() -> None:
                 st.success("Daily alert digest email sent.")
             elif daily_result.get("email_error"):
                 st.warning(f"Scan completed, but email was not sent: {daily_result['email_error']}")
+
+            macro_snapshot = daily_result.get("macro_snapshot", {})
+            if requested_scan_mode == "sp500":
+                st.markdown("### Macro Regime — S&P 500 Sector Overlay")
+                if macro_snapshot.get("available"):
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("10Y Treasury", f"{safe_float(macro_snapshot.get('ten_year_yield_pct')):.2f}%")
+                    change20 = safe_float(macro_snapshot.get("ten_year_change_20d_bps"))
+                    m2.metric("10Y Change (20D)", f"{change20:+.0f} bps" if np.isfinite(change20) else "N/A")
+                    m3.metric("Rate Regime", macro_snapshot.get("regime", "N/A"))
+                    curve = safe_float(macro_snapshot.get("curve_10y_3m_bps"))
+                    m4.metric("10Y - 3M Curve", f"{curve:+.0f} bps" if np.isfinite(curve) else "N/A")
+
+                    sector_macro_rows = []
+                    for sector_name, sector_data in macro_snapshot.get("sectors", {}).items():
+                        sector_macro_rows.append({
+                            "Sector": sector_name,
+                            "ETF": sector_data.get("etf"),
+                            "Macro Score": sector_data.get("macro_score"),
+                            "Macro Label": sector_data.get("label"),
+                            "20D vs SPY %": sector_data.get("relative_to_spy_20d_pct"),
+                        })
+                    if sector_macro_rows:
+                        sector_macro_df = pd.DataFrame(sector_macro_rows).sort_values("Macro Score", ascending=False)
+                        st.dataframe(
+                            sector_macro_df.style.format({"Macro Score": "{:.1f}", "20D vs SPY %": "{:+.2f}%"}),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                    st.caption(
+                        "Macro-Adjusted Score = 85% existing technical Strategy Score + 15% sector macro score. "
+                        "The original Strategy Score is unchanged for validation."
+                    )
+                else:
+                    st.warning(f"Macro overlay unavailable: {macro_snapshot.get('reason', 'unknown reason')}")
+
             if alerts:
                 HIGH_OVERALL_SCORE = 80
                 HIGH_SQUEEZE_SCORE = 70
@@ -3104,6 +3361,11 @@ def main() -> None:
                         "Momentum Compression": r.get("Momentum Compression Score"),
                         "Momentum Bias": r.get("Momentum Compression Bias"),
                         "Squeeze-Momentum": r.get("Squeeze-Momentum Score"),
+                        "Sector": r.get("Sector"),
+                        "Macro Regime": r.get("Macro Regime"),
+                        "Sector Macro": r.get("Sector Macro Score"),
+                        "Macro Label": r.get("Sector Macro Label"),
+                        "Macro-Adjusted": r.get("Macro-Adjusted Score"),
                     }
 
                 high_squeeze = [
