@@ -3698,6 +3698,7 @@ def main() -> None:
 
         if resistance_targets:
             st.markdown("### 🧱 Resistance Dashboard")
+            st.caption("Strength Lookback: 504 sessions (~2 years) · Resistance Zone: ±1.0%")
             resistance_cols = st.columns(len(resistance_targets))
 
             for idx, target in enumerate(resistance_targets):
