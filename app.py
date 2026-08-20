@@ -1869,6 +1869,41 @@ def calculate_resistance_break_score(
     return {"available": True, "score": score, "label": label}
 
 
+
+def estimate_resistance_break_probability(break_score: Any) -> dict[str, Any]:
+    """
+    Convert the heuristic Break This Resistance Score into an estimated
+    5-session break probability for display.
+
+    IMPORTANT: this is an uncalibrated model estimate, not an empirically
+    backtested probability. Replace this mapping with observed outcome
+    frequencies once enough resistance-event history has been collected.
+    """
+    score = safe_float(break_score)
+    if not np.isfinite(score):
+        return {"available": False, "probability": np.nan, "label": "N/A"}
+
+    score = max(0.0, min(100.0, score))
+
+    # Conservative monotonic mapping: compress extremes so a heuristic
+    # score is not misrepresented as a same-number probability.
+    probability = 15.0 + 0.70 * score
+    probability = max(10.0, min(85.0, probability))
+
+    label = (
+        "VERY HIGH" if probability >= 70
+        else "HIGH" if probability >= 55
+        else "MODERATE" if probability >= 40
+        else "LOW"
+    )
+    return {
+        "available": True,
+        "probability": round(probability, 1),
+        "label": label,
+        "horizon_sessions": 5,
+        "calibrated": False,
+    }
+
 def calculate_breakout_targets(
     df: pd.DataFrame,
     box_result: dict[str, Any],
@@ -2570,9 +2605,12 @@ def send_daily_scan_email(
                         )
                     if np.isfinite(rb):
                         target_line += (
-                            f" | Break Score {rb:.0f}/100 "
+                            f" | Break This Resistance Score {rb:.0f}/100 "
                             f"({target.get('resistance_break_label', 'N/A')})"
                         )
+                    rp = safe_float(target.get("resistance_break_probability"))
+                    if np.isfinite(rp):
+                        target_line += f" | Est. 5-session Break Probability {rp:.1f}%"
 
                 lines.append(target_line)
             lines.append("")
@@ -2609,7 +2647,7 @@ def send_daily_scan_email(
                     )
                 if np.isfinite(rb):
                     target_line += (
-                        f" | Break Score {rb:.0f}/100 "
+                        f" | Break This Resistance Score {rb:.0f}/100 "
                         f"({target.get('resistance_break_label', 'N/A')})"
                     )
                 lines.append(target_line)
@@ -2801,6 +2839,10 @@ def run_daily_market_scan(
             )
             target["resistance_break_score"] = safe_float(rb.get("score"))
             target["resistance_break_label"] = rb.get("label", "N/A")
+            break_probability = estimate_resistance_break_probability(rb.get("score"))
+            target["resistance_break_probability"] = safe_float(
+                break_probability.get("probability")
+            )
 
         mcomp = safe_float(r.get("Momentum Compression Score"), 0.0)
         mbox = safe_float(r.get("Momentum Box Score"), 0.0)
@@ -3738,11 +3780,19 @@ def main() -> None:
                         else "**Strength:** N/A"
                     )
                     st.write(
-                        f"**Break Score:** {safe_float(rb.get('score')):.0f}/100 "
+                        f"**Break This Resistance Score:** {safe_float(rb.get('score')):.0f}/100 "
                         f"({rb.get('label', 'N/A')})"
                         if np.isfinite(safe_float(rb.get("score")))
-                        else "**Break Score:** N/A"
+                        else "**Break This Resistance Score:** N/A"
                     )
+                    break_probability = estimate_resistance_break_probability(rb.get("score"))
+                    if break_probability.get("available"):
+                        st.write(
+                            f"**Resistance Break Probability (5 sessions):** "
+                            f"{safe_float(break_probability.get('probability')):.1f}% "
+                            f"({break_probability.get('label', 'N/A')})"
+                        )
+                        st.caption("Estimated from Break This Resistance Score; not yet historically calibrated.")
                     detail = f"{tests} prior test{'s' if tests != 1 else ''}"
                     if np.isfinite(rejection):
                         detail += f" · avg rejection {rejection:.1f}%"
@@ -4043,7 +4093,7 @@ def main() -> None:
                         "Strength": f"{safe_float(strength.get('score')):.0f}/100 {strength.get('label','N/A')}",
                         "Tests": strength.get("tests", 0),
                         "Avg Rejection %": safe_float(strength.get("avg_rejection_pct")),
-                        "Break Score": f"{safe_float(break_score.get('score')):.0f}/100 {break_score.get('label','N/A')}",
+                        "Break This Resistance Score": f"{safe_float(break_score.get('score')):.0f}/100 {break_score.get('label','N/A')}",
                     })
                 preview = pd.DataFrame(resistance_rows)
                 st.subheader("Overhead Resistance if Breakout Occurs")
@@ -4098,9 +4148,11 @@ def main() -> None:
                         f"Nearest historical resistance is {format_currency(nearest['price'])} "
                         f"({nearest['upside_from_price_pct']:+.1f}% from the latest close). "
                         f"Strength {safe_float(nearest_strength.get('score')):.0f}/100 "
-                        f"({nearest_strength.get('label','N/A')}); Break Score "
+                        f"({nearest_strength.get('label','N/A')}); Break This Resistance Score "
                         f"{safe_float(nearest_break.get('score')):.0f}/100 "
-                        f"({nearest_break.get('label','N/A')})."
+                        f"({nearest_break.get('label','N/A')}); "
+                        f"Estimated 5-session Resistance Break Probability "
+                        f"{safe_float(estimate_resistance_break_probability(nearest_break.get('score')).get('probability')):.1f}%."
                     )
                 if darvas:
                     st.info(
