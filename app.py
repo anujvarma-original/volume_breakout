@@ -1725,147 +1725,170 @@ def find_prior_resistance_levels(
     return levels[:max_levels]
 
 
+
 def evaluate_resistance_strength(
     df: pd.DataFrame,
     level: float,
-    current_price: float | None = None,
-    tolerance_pct: float = 1.0,
+    current_price: float,
+    tolerance_pct: float = 1.5,
+    lookback: int = 365,
 ) -> dict[str, Any]:
-    """Return a 0-100 structural resistance-strength score.
-
-    The score is heuristic (not a probability) and uses only the already-loaded
-    OHLCV history: independent tests, rejection magnitude, test volume, recency,
-    longevity, and confluence with 6/12-month highs.
-    """
-    level = safe_float(level)
+    """Heuristic 0-100 structural strength score for a historical resistance level."""
     if df is None or df.empty or not np.isfinite(level) or level <= 0:
-        return {"available": False, "score": np.nan, "label": "N/A"}
+        return {"available": False, "score": 0, "label": "N/A", "tests": 0, "avg_rejection_pct": np.nan}
 
-    hist = df.tail(504).copy()
-    if len(hist) < 30:
-        return {"available": False, "score": np.nan, "label": "N/A"}
-
-    tol = max(0.003, tolerance_pct / 100.0)
+    hist = df.tail(min(len(df), lookback)).copy()
     highs = hist["High"].astype(float)
-    raw_positions = np.flatnonzero(((highs.sub(level).abs() / level) <= tol).to_numpy())
+    closes = hist["Close"].astype(float)
+    vols = hist["Volume"].astype(float)
+    vol_avg20 = vols.rolling(20, min_periods=5).mean()
 
-    touch_positions: list[int] = []
-    for pos in raw_positions:
-        pos = int(pos)
-        if not touch_positions or pos - touch_positions[-1] >= 4:
-            touch_positions.append(pos)
-        elif abs(safe_float(highs.iloc[pos]) - level) < abs(safe_float(highs.iloc[touch_positions[-1]]) - level):
-            touch_positions[-1] = pos
+    tol = tolerance_pct / 100.0
+    touch_idx = hist.index[(highs.sub(level).abs() / level) <= tol]
+    positions = [hist.index.get_loc(i) for i in touch_idx]
 
-    tests = len(touch_positions)
-    test_points = min(25.0, tests * 6.25)
+    distinct = []
+    last = -999
+    for p in positions:
+        if p - last >= 5:
+            distinct.append(p)
+            last = p
 
-    rejection_pcts: list[float] = []
-    relative_volumes: list[float] = []
-    for pos in touch_positions:
-        end = min(len(hist), pos + 6)
-        if end > pos + 1:
-            subsequent_low = safe_float(hist["Low"].iloc[pos + 1:end].min())
-            if np.isfinite(subsequent_low):
-                rejection_pcts.append(max(0.0, (level - subsequent_low) / level * 100.0))
-        vol = safe_float(hist["Volume"].iloc[pos], 0.0)
-        baseline = safe_float(hist["Volume"].iloc[max(0, pos - 20):pos].mean(), 0.0)
-        if baseline > 0:
-            relative_volumes.append(vol / baseline)
+    tests = len(distinct)
+    if tests == 0:
+        return {"available": True, "score": 10, "label": "WEAK", "tests": 0, "avg_rejection_pct": np.nan}
 
-    avg_rejection = float(np.mean(rejection_pcts)) if rejection_pcts else 0.0
-    rejection_points = min(20.0, avg_rejection / 5.0 * 20.0)
+    rejections = []
+    volume_multiples = []
+    recencies = []
+    for p in distinct:
+        test_close = float(closes.iloc[p])
+        future = closes.iloc[p + 1:min(len(closes), p + 6)]
+        if not future.empty and test_close > 0:
+            worst_after = float(future.min())
+            rejections.append(max(0.0, (test_close - worst_after) / test_close * 100))
 
-    avg_test_volume = float(np.mean(relative_volumes)) if relative_volumes else np.nan
-    volume_points = (
-        max(0.0, min(15.0, (avg_test_volume - 0.6) / 1.4 * 15.0))
-        if np.isfinite(avg_test_volume) else 0.0
-    )
+        va = safe_float(vol_avg20.iloc[p])
+        vv = safe_float(vols.iloc[p])
+        if np.isfinite(va) and va > 0:
+            volume_multiples.append(vv / va)
 
-    if touch_positions:
-        sessions_since_last = len(hist) - 1 - touch_positions[-1]
-        recency_points = 10.0 if sessions_since_last <= 20 else 7.0 if sessions_since_last <= 60 else 4.0 if sessions_since_last <= 120 else 2.0
-        span = touch_positions[-1] - touch_positions[0] if tests >= 2 else 0
-        longevity_points = min(15.0, span / 180.0 * 15.0) if tests >= 2 else 0.0
-    else:
-        sessions_since_last = np.nan
-        recency_points = 0.0
-        longevity_points = 0.0
+        recencies.append(len(hist) - 1 - p)
+
+    avg_rej = float(np.mean(rejections)) if rejections else np.nan
+    avg_vol = float(np.mean(volume_multiples)) if volume_multiples else np.nan
+    most_recent = min(recencies) if recencies else 999
+
+    test_points = min(30.0, tests * 7.5)
+    rejection_points = min(25.0, (avg_rej if np.isfinite(avg_rej) else 0.0) * 5.0)
+
+    volume_points = 0.0
+    if np.isfinite(avg_vol):
+        volume_points = min(15.0, max(0.0, (avg_vol - 0.8) / 0.8 * 15.0))
+
+    recency_points = 15.0 if most_recent <= 20 else 10.0 if most_recent <= 60 else 5.0 if most_recent <= 120 else 0.0
 
     prior = hist.iloc[:-1] if len(hist) > 1 else hist
-    high_126 = safe_float(prior["High"].tail(126).max())
-    high_252 = safe_float(prior["High"].tail(252).max())
-    confluence_points = 0.0
-    if np.isfinite(high_126) and abs(level - high_126) / level <= 0.015:
-        confluence_points += 7.5
-    if np.isfinite(high_252) and abs(level - high_252) / level <= 0.015:
-        confluence_points += 7.5
+    major_highs = []
+    for window in (55, 120, 252):
+        if len(prior) >= min(window, 20):
+            h = safe_float(prior["High"].tail(window).max())
+            if np.isfinite(h):
+                major_highs.append(h)
 
-    score = int(round(max(0.0, min(100.0, test_points + rejection_points + volume_points + recency_points + longevity_points + confluence_points))))
+    confluence = any(abs(level - h) / level <= 0.015 for h in major_highs)
+    confluence_points = 15.0 if confluence else 0.0
+
+    score = int(round(min(
+        100.0,
+        test_points + rejection_points + volume_points + recency_points + confluence_points
+    )))
     label = "VERY STRONG" if score >= 80 else "STRONG" if score >= 60 else "MODERATE" if score >= 40 else "WEAK"
-    price = safe_float(current_price)
-    distance_pct = (level / price - 1.0) * 100.0 if np.isfinite(price) and price > 0 else np.nan
 
     return {
         "available": True,
         "score": score,
         "label": label,
         "tests": tests,
-        "avg_rejection_pct": avg_rejection,
-        "avg_test_volume_multiple": avg_test_volume,
-        "sessions_since_last_test": sessions_since_last,
-        "distance_pct": distance_pct,
+        "avg_rejection_pct": avg_rej,
+        "avg_test_volume_multiple": avg_vol,
+        "most_recent_test_sessions": most_recent,
+        "confluence": confluence,
     }
 
 
-def calculate_resistance_break_score(
-    resistance: dict[str, Any],
+def evaluate_resistance_break_score(
+    resistance_strength: dict[str, Any],
+    level: float,
+    current_price: float,
     momentum_box: dict[str, Any],
     momentum_compression: dict[str, Any],
-    squeeze_score: float = np.nan,
-    volume_multiple: float = np.nan,
+    box_result: dict[str, Any],
+    squeeze_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return a 0-100 heuristic score for the ability to clear resistance."""
-    if not resistance or not resistance.get("available"):
-        return {"available": False, "score": np.nan, "label": "N/A"}
+    """Heuristic 0-100 score for the current setup's ability to clear a resistance level."""
+    if (
+        not resistance_strength.get("available")
+        or not np.isfinite(level)
+        or not np.isfinite(current_price)
+        or current_price <= 0
+    ):
+        return {"available": False, "score": 0, "label": "N/A"}
 
-    strength = max(0.0, min(100.0, safe_float(resistance.get("score"), 50.0)))
-    mbox = max(0.0, min(100.0, safe_float(momentum_box.get("score"), 50.0)))
-    mcomp = max(0.0, min(100.0, safe_float(momentum_compression.get("score"), 0.0)))
+    strength = safe_float(resistance_strength.get("score"), 50.0)
+    momentum = safe_float(momentum_box.get("score"), 50.0) if momentum_box.get("available") else 50.0
+    compression = safe_float(momentum_compression.get("score"), 50.0) if momentum_compression.get("available") else 50.0
+    volume_mult = safe_float(box_result.get("volume_multiple"), 1.0)
+    distance_pct = max(0.0, (level / current_price - 1.0) * 100.0)
+
+    score = 50.0
+    score += (momentum - 50.0) * 0.35
+    score += (compression - 50.0) * 0.15
+    score += min(18.0, max(-8.0, (volume_mult - 1.0) * 12.0))
+    score -= (strength - 50.0) * 0.30
+
+    if distance_pct <= 1:
+        score += 8
+    elif distance_pct <= 3:
+        score += 5
+    elif distance_pct <= 7:
+        score += 2
+    elif distance_pct >= 15:
+        score -= 6
+
+    traj = str(momentum_box.get("trajectory", ""))
+    if "ACCELERATING" in traj:
+        score += 8
+    elif "IMPROVING" in traj:
+        score += 4
+    elif "DECELERATING" in traj:
+        score -= 8
+    elif "SOFTENING" in traj:
+        score -= 4
+
     bias = str(momentum_compression.get("bias", "NEUTRAL")).upper()
-    trajectory = str(momentum_box.get("trajectory", "")).upper()
-    distance = safe_float(resistance.get("distance_pct"))
+    if bias == "BULLISH":
+        score += 5
+    elif bias == "BEARISH":
+        score -= 5
 
-    score = 30.0 * (1.0 - strength / 100.0)
-    score += 25.0 * mbox / 100.0
-
-    vm = safe_float(volume_multiple)
-    if np.isfinite(vm):
-        score += max(0.0, min(15.0, (vm - 0.5) / 1.5 * 15.0))
-
-    bias_factor = 1.0 if bias == "BULLISH" else 0.5 if bias == "NEUTRAL" else 0.15
-    score += 10.0 * mcomp / 100.0 * bias_factor
-
-    sq = safe_float(squeeze_score)
-    if np.isfinite(sq):
-        score += 10.0 * max(0.0, min(100.0, sq)) / 100.0
-
-    if np.isfinite(distance):
-        score += 10.0 if distance <= 1.0 else 7.0 if distance <= 3.0 else 4.0 if distance <= 5.0 else 1.0
-
-    if "ACCELERATING" in trajectory:
-        score += 3.0
-    elif "IMPROVING" in trajectory:
-        score += 1.5
-    elif "DECELERATING" in trajectory:
-        score -= 3.0
-    elif "SOFTENING" in trajectory:
-        score -= 1.5
+    if squeeze_snapshot and squeeze_snapshot.get("available"):
+        sq = safe_float(
+            squeeze_snapshot.get("score", squeeze_snapshot.get("Short Squeeze Potential")),
+            np.nan,
+        )
+        if np.isfinite(sq):
+            score += max(0.0, sq - 50.0) * 0.10
 
     score = int(round(max(0.0, min(100.0, score))))
-    label = "VERY HIGH" if score >= 80 else "HIGH" if score >= 65 else "MIXED" if score >= 45 else "LOW"
-    return {"available": True, "score": score, "label": label}
+    label = "VERY HIGH" if score >= 80 else "HIGH" if score >= 65 else "MODERATE" if score >= 45 else "LOW"
 
+    return {
+        "available": True,
+        "score": score,
+        "label": label,
+        "distance_pct": distance_pct,
+    }
 
 def calculate_breakout_targets(
     df: pd.DataFrame,
@@ -2137,6 +2160,215 @@ def get_scan_universe(scan_mode: str) -> tuple[list[str], str, str]:
     if mode == "nasdaq100":
         return get_nasdaq100_tickers(), "QQQ", "NASDAQ-100"
     return get_sp500_tickers(), "SPY", "S&P 500"
+
+
+# --- S&P 500 macro/sector overlay -------------------------------------------------
+# Positive sensitivity means rising long rates are generally a headwind for the
+# sector. A small negative value means rising rates can be modestly supportive.
+SECTOR_ETF_MAP: dict[str, str] = {
+    "Communication Services": "XLC",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Financials": "XLF",
+    "Health Care": "XLV",
+    "Industrials": "XLI",
+    "Information Technology": "XLK",
+    "Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+}
+
+SECTOR_RATE_SENSITIVITY: dict[str, float] = {
+    "Information Technology": 1.00,
+    "Real Estate": 1.00,
+    "Utilities": 0.90,
+    "Consumer Discretionary": 0.75,
+    "Communication Services": 0.65,
+    "Health Care": 0.35,
+    "Industrials": 0.35,
+    "Materials": 0.25,
+    "Consumer Staples": 0.20,
+    "Energy": 0.10,
+    "Financials": -0.25,
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sp500_sector_map() -> dict[str, str]:
+    """Map S&P 500 Yahoo symbols to GICS sectors using the constituent source."""
+    urls = [
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+    ]
+    for url in urls:
+        try:
+            table = pd.read_csv(url)
+            symbol_col = next((c for c in table.columns if str(c).strip().lower() in {"symbol", "ticker"}), None)
+            sector_col = next((c for c in table.columns if str(c).strip().lower() in {"gics sector", "sector"}), None)
+            if symbol_col and sector_col:
+                mapping = {
+                    str(row[symbol_col]).strip().upper().replace(".", "-"): str(row[sector_col]).strip()
+                    for _, row in table[[symbol_col, sector_col]].dropna().iterrows()
+                }
+                if len(mapping) >= 450:
+                    return mapping
+        except Exception:
+            pass
+
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        for table in tables:
+            symbol_col = next((c for c in table.columns if str(c).strip().lower() in {"symbol", "ticker symbol"}), None)
+            sector_col = next((c for c in table.columns if str(c).strip().lower() in {"gics sector", "sector"}), None)
+            if symbol_col and sector_col:
+                mapping = {
+                    str(row[symbol_col]).strip().upper().replace(".", "-"): str(row[sector_col]).strip()
+                    for _, row in table[[symbol_col, sector_col]].dropna().iterrows()
+                }
+                if len(mapping) >= 450:
+                    return mapping
+        
+    except Exception:
+        pass
+    return {}
+
+
+def _yield_percent_from_index(value: float) -> float:
+    """Normalize Yahoo yield-index quotes to a percentage yield when possible."""
+    v = safe_float(value)
+    if not np.isfinite(v):
+        return np.nan
+    # Some yield indices historically quote 10x the percentage; others quote the
+    # percentage directly. This keeps the calculation robust to either convention.
+    return v / 10.0 if v > 20 else v
+
+
+def evaluate_macro_sector_snapshot() -> dict[str, Any]:
+    """Fetch one macro/sector batch and derive a reusable S&P sector regime.
+
+    The expensive market-data call happens once per scan. Per-stock macro scores are
+    then pure local arithmetic based on the stock's GICS sector.
+    """
+    symbols = ["^TNX", "^IRX", "SPY"] + list(SECTOR_ETF_MAP.values())
+    try:
+        data = download_market_data_batch(tuple(dict.fromkeys(symbols)), "6mo", chunk_size=50)
+    except Exception as exc:
+        return {"available": False, "reason": f"Macro batch download failed: {exc}"}
+
+    tnx = data.get("^TNX")
+    spy = data.get("SPY")
+    if tnx is None or tnx.empty or spy is None or spy.empty or len(tnx) < 21 or len(spy) < 21:
+        return {"available": False, "reason": "10Y Treasury and/or SPY macro history unavailable"}
+
+    y10_now = _yield_percent_from_index(tnx["Close"].iloc[-1])
+    y10_5 = _yield_percent_from_index(tnx["Close"].iloc[-6]) if len(tnx) >= 6 else np.nan
+    y10_20 = _yield_percent_from_index(tnx["Close"].iloc[-21])
+    change_5_bps = (y10_now - y10_5) * 100 if np.isfinite(y10_5) else np.nan
+    change_20_bps = (y10_now - y10_20) * 100 if np.isfinite(y10_20) else np.nan
+
+    # Positive rate_pressure = rising yields/headwind; negative = falling/tailwind.
+    p5 = 0.0 if not np.isfinite(change_5_bps) else max(-100.0, min(100.0, change_5_bps / 10.0 * 100.0))
+    p20 = 0.0 if not np.isfinite(change_20_bps) else max(-100.0, min(100.0, change_20_bps / 25.0 * 100.0))
+    rate_pressure = max(-100.0, min(100.0, 0.35 * p5 + 0.65 * p20))
+
+    if rate_pressure >= 60:
+        regime = "STRONG RATE HEADWIND"
+    elif rate_pressure >= 25:
+        regime = "RATE HEADWIND"
+    elif rate_pressure <= -60:
+        regime = "STRONG RATE TAILWIND"
+    elif rate_pressure <= -25:
+        regime = "RATE TAILWIND"
+    else:
+        regime = "RATE NEUTRAL"
+
+    spy_ret20 = (safe_float(spy["Close"].iloc[-1]) / safe_float(spy["Close"].iloc[-21]) - 1.0) * 100.0
+    sector_rows: dict[str, dict[str, Any]] = {}
+    for sector, etf in SECTOR_ETF_MAP.items():
+        frame = data.get(etf)
+        if frame is None or frame.empty or len(frame) < 21:
+            sector_rows[sector] = {
+                "sector": sector,
+                "etf": etf,
+                "available": False,
+                "macro_score": 50.0,
+                "label": "NEUTRAL / DATA UNAVAILABLE",
+            }
+            continue
+        sector_ret20 = (safe_float(frame["Close"].iloc[-1]) / safe_float(frame["Close"].iloc[-21]) - 1.0) * 100.0
+        rel20 = sector_ret20 - spy_ret20
+        sensitivity = SECTOR_RATE_SENSITIVITY.get(sector, 0.35)
+
+        # Rate component can move the sector macro score by roughly +/-30 points.
+        # Relative sector leadership can add/subtract up to 20 points.
+        rate_component = -0.30 * rate_pressure * sensitivity
+        relative_component = max(-20.0, min(20.0, rel20 * 2.0))
+        macro_score = max(0.0, min(100.0, 50.0 + rate_component + relative_component))
+        if macro_score >= 65:
+            label = "TAILWIND"
+        elif macro_score <= 35:
+            label = "HEADWIND"
+        else:
+            label = "NEUTRAL"
+        sector_rows[sector] = {
+            "sector": sector,
+            "etf": etf,
+            "available": True,
+            "macro_score": round(macro_score, 1),
+            "label": label,
+            "rate_sensitivity": sensitivity,
+            "sector_20d_return_pct": sector_ret20,
+            "relative_to_spy_20d_pct": rel20,
+        }
+
+    irx = data.get("^IRX")
+    y3m = np.nan
+    curve_bps = np.nan
+    if irx is not None and not irx.empty:
+        y3m = _yield_percent_from_index(irx["Close"].iloc[-1])
+        if np.isfinite(y10_now) and np.isfinite(y3m):
+            curve_bps = (y10_now - y3m) * 100.0
+
+    return {
+        "available": True,
+        "regime": regime,
+        "rate_pressure": round(rate_pressure, 1),
+        "ten_year_yield_pct": y10_now,
+        "ten_year_change_5d_bps": change_5_bps,
+        "ten_year_change_20d_bps": change_20_bps,
+        "three_month_yield_pct": y3m,
+        "curve_10y_3m_bps": curve_bps,
+        "spy_20d_return_pct": spy_ret20,
+        "sectors": sector_rows,
+    }
+
+
+def apply_sector_macro_overlay(
+    row: dict[str, Any],
+    sector_map: dict[str, str],
+    macro_snapshot: dict[str, Any],
+) -> None:
+    """Add macro metadata without changing the existing technical Strategy Score."""
+    ticker = str(row.get("Ticker", ""))
+    technical = safe_float(row.get("Strategy Score"))
+    sector = sector_map.get(ticker, "N/A")
+    row["Sector"] = sector
+    row["Macro Regime"] = macro_snapshot.get("regime", "N/A") if macro_snapshot.get("available") else "N/A"
+
+    sector_data = macro_snapshot.get("sectors", {}).get(sector, {}) if macro_snapshot.get("available") else {}
+    if sector == "N/A" or not sector_data:
+        row["Sector Macro Score"] = np.nan
+        row["Sector Macro Label"] = "N/A"
+        row["Macro-Adjusted Score"] = technical
+        return
+
+    macro_score = safe_float(sector_data.get("macro_score"), 50.0)
+    row["Sector Macro Score"] = macro_score
+    row["Sector Macro Label"] = sector_data.get("label", "NEUTRAL")
+    row["Sector ETF"] = sector_data.get("etf", "")
+    row["Sector vs SPY 20D %"] = safe_float(sector_data.get("relative_to_spy_20d_pct"))
+    # Technical signal remains dominant; macro contributes 15% of the combined view.
+    row["Macro-Adjusted Score"] = round(max(0.0, min(100.0, 0.85 * technical + 0.15 * macro_score)), 1)
 
 
 def normalize_download_frame(data: pd.DataFrame) -> pd.DataFrame:
@@ -2711,6 +2943,17 @@ def run_daily_market_scan(
         r["Dual Coiled Bullish"] = flags["dual"]
         r["Squeeze + Momentum Compression"] = flags["squeeze_momentum"]
 
+    # S&P-only macro overlay. Fetch macro/sector data once, then reuse locally for every stock.
+    macro_snapshot: dict[str, Any] = {"available": False, "reason": "Macro overlay is enabled for S&P 500 scans only."}
+    if scan_mode == "sp500":
+        try:
+            macro_snapshot = evaluate_macro_sector_snapshot()
+            sector_map = get_sp500_sector_map()
+            for row in results:
+                apply_sector_macro_overlay(row, sector_map, macro_snapshot)
+        except Exception as exc:
+            macro_snapshot = {"available": False, "reason": str(exc)}
+
     # First grade older signals with today's downloaded candles, then store today's signals.
     reviewed_now = review_mature_signals(market_data, sessions=5)
     signals_added = record_new_signals(alerts)
@@ -2754,6 +2997,7 @@ def run_daily_market_scan(
         "email_error": email_error,
         "signals_added": signals_added,
         "signals_reviewed": reviewed_now,
+        "macro_snapshot": macro_snapshot,
     }
 
 
@@ -3222,6 +3466,42 @@ def main() -> None:
                 st.success("Daily alert digest email sent.")
             elif daily_result.get("email_error"):
                 st.warning(f"Scan completed, but email was not sent: {daily_result['email_error']}")
+
+            macro_snapshot = daily_result.get("macro_snapshot", {})
+            if requested_scan_mode == "sp500":
+                st.markdown("### Macro Regime — S&P 500 Sector Overlay")
+                if macro_snapshot.get("available"):
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("10Y Treasury", f"{safe_float(macro_snapshot.get('ten_year_yield_pct')):.2f}%")
+                    change20 = safe_float(macro_snapshot.get("ten_year_change_20d_bps"))
+                    m2.metric("10Y Change (20D)", f"{change20:+.0f} bps" if np.isfinite(change20) else "N/A")
+                    m3.metric("Rate Regime", macro_snapshot.get("regime", "N/A"))
+                    curve = safe_float(macro_snapshot.get("curve_10y_3m_bps"))
+                    m4.metric("10Y - 3M Curve", f"{curve:+.0f} bps" if np.isfinite(curve) else "N/A")
+
+                    sector_macro_rows = []
+                    for sector_name, sector_data in macro_snapshot.get("sectors", {}).items():
+                        sector_macro_rows.append({
+                            "Sector": sector_name,
+                            "ETF": sector_data.get("etf"),
+                            "Macro Score": sector_data.get("macro_score"),
+                            "Macro Label": sector_data.get("label"),
+                            "20D vs SPY %": sector_data.get("relative_to_spy_20d_pct"),
+                        })
+                    if sector_macro_rows:
+                        sector_macro_df = pd.DataFrame(sector_macro_rows).sort_values("Macro Score", ascending=False)
+                        st.dataframe(
+                            sector_macro_df.style.format({"Macro Score": "{:.1f}", "20D vs SPY %": "{:+.2f}%"}),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                    st.caption(
+                        "Macro-Adjusted Score = 85% existing technical Strategy Score + 15% sector macro score. "
+                        "The original Strategy Score is unchanged for validation."
+                    )
+                else:
+                    st.warning(f"Macro overlay unavailable: {macro_snapshot.get('reason', 'unknown reason')}")
+
             if alerts:
                 HIGH_OVERALL_SCORE = 80
                 HIGH_SQUEEZE_SCORE = 70
@@ -3246,6 +3526,11 @@ def main() -> None:
                         "Momentum Compression": r.get("Momentum Compression Score"),
                         "Momentum Bias": r.get("Momentum Compression Bias"),
                         "Squeeze-Momentum": r.get("Squeeze-Momentum Score"),
+                        "Sector": r.get("Sector"),
+                        "Macro Regime": r.get("Macro Regime"),
+                        "Sector Macro": r.get("Sector Macro Score"),
+                        "Macro Label": r.get("Sector Macro Label"),
+                        "Macro-Adjusted": r.get("Macro-Adjusted Score"),
                     }
 
                 high_squeeze = [
@@ -3862,39 +4147,39 @@ def main() -> None:
 
             resistance_preview = find_prior_resistance_levels(asset_df, box_result)
             if resistance_preview:
-                resistance_rows = []
+                current_px = safe_float(box_result["latest_close"])
+                preview_rows = []
                 for i, level in enumerate(resistance_preview, start=1):
-                    strength = evaluate_resistance_strength(
-                        asset_df, level, current_price=safe_float(box_result["latest_close"])
-                    )
-                    break_score = calculate_resistance_break_score(
-                        strength,
+                    rs = evaluate_resistance_strength(asset_df, level, current_px)
+                    rb = evaluate_resistance_break_score(
+                        rs,
+                        level,
+                        current_px,
                         momentum_box,
                         momentum_compression,
-                        squeeze_score=safe_float(squeeze_snapshot.get("score")) if squeeze_snapshot.get("available") else np.nan,
-                        volume_multiple=safe_float(box_result.get("volume_multiple")),
+                        box_result,
+                        squeeze_snapshot,
                     )
-                    resistance_rows.append({
+                    preview_rows.append({
                         "Resistance": f"R{i}",
                         "Price": level,
-                        "Room from current price (%)": (level / safe_float(box_result["latest_close"]) - 1) * 100,
-                        "Strength": f"{safe_float(strength.get('score')):.0f}/100 {strength.get('label','N/A')}",
-                        "Tests": strength.get("tests", 0),
-                        "Avg Rejection %": safe_float(strength.get("avg_rejection_pct")),
-                        "Break Score": f"{safe_float(break_score.get('score')):.0f}/100 {break_score.get('label','N/A')}",
+                        "Room from current price (%)": (level / current_px - 1) * 100,
+                        "Strength": f"{rs.get('score', 0)}/100 {rs.get('label', 'N/A')}",
+                        "Break Score": f"{rb.get('score', 0)}/100 {rb.get('label', 'N/A')}",
+                        "Tests": rs.get("tests", 0),
+                        "Avg Rejection (%)": rs.get("avg_rejection_pct", np.nan),
                     })
-                preview = pd.DataFrame(resistance_rows)
+                preview = pd.DataFrame(preview_rows)
                 st.subheader("Overhead Resistance if Breakout Occurs")
                 st.dataframe(
                     preview.style.format({
                         "Price": "${:,.2f}",
                         "Room from current price (%)": "{:.2f}%",
-                        "Avg Rejection %": "{:.2f}%",
+                        "Avg Rejection (%)": "{:.2f}%",
                     }),
                     hide_index=True,
                     use_container_width=True,
                 )
-                st.caption("Resistance Break Score is heuristic and is not yet a calibrated probability.")
             else:
                 st.caption("No clear prior swing resistance above the current price was found in the available history.")
 
@@ -3919,26 +4204,48 @@ def main() -> None:
                 )
                 nearest = breakout_targets.get("nearest_resistance")
                 darvas = breakout_targets.get("darvas_target")
+
+                resistance_levels = find_prior_resistance_levels(asset_df, box_result)
+                if resistance_levels:
+                    current_px = safe_float(box_result.get("latest_close"))
+                    resistance_rows = []
+                    for i, level in enumerate(resistance_levels, start=1):
+                        rs = evaluate_resistance_strength(asset_df, level, current_px)
+                        rb = evaluate_resistance_break_score(
+                            rs,
+                            level,
+                            current_px,
+                            momentum_box,
+                            momentum_compression,
+                            box_result,
+                            squeeze_snapshot,
+                        )
+                        resistance_rows.append({
+                            "Resistance": f"R{i}",
+                            "Price": level,
+                            "Room from current price (%)": (level / current_px - 1) * 100,
+                            "Strength": f"{rs.get('score', 0)}/100 {rs.get('label', 'N/A')}",
+                            "Break Score": f"{rb.get('score', 0)}/100 {rb.get('label', 'N/A')}",
+                            "Tests": rs.get("tests", 0),
+                            "Avg Rejection (%)": rs.get("avg_rejection_pct", np.nan),
+                        })
+
+                    st.subheader("Historical Resistance Strength")
+                    resistance_df = pd.DataFrame(resistance_rows)
+                    st.dataframe(
+                        resistance_df.style.format({
+                            "Price": "${:,.2f}",
+                            "Room from current price (%)": "{:.2f}%",
+                            "Avg Rejection (%)": "{:.2f}%",
+                        }),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
                 if nearest:
-                    nearest_strength = evaluate_resistance_strength(
-                        asset_df,
-                        nearest.get("price"),
-                        current_price=safe_float(box_result.get("latest_close")),
-                    )
-                    nearest_break = calculate_resistance_break_score(
-                        nearest_strength,
-                        momentum_box,
-                        momentum_compression,
-                        squeeze_score=safe_float(squeeze_snapshot.get("score")) if squeeze_snapshot.get("available") else np.nan,
-                        volume_multiple=safe_float(box_result.get("volume_multiple")),
-                    )
                     st.info(
                         f"Nearest historical resistance is {format_currency(nearest['price'])} "
-                        f"({nearest['upside_from_price_pct']:+.1f}% from the latest close). "
-                        f"Strength {safe_float(nearest_strength.get('score')):.0f}/100 "
-                        f"({nearest_strength.get('label','N/A')}); Break Score "
-                        f"{safe_float(nearest_break.get('score')):.0f}/100 "
-                        f"({nearest_break.get('label','N/A')})."
+                        f"({nearest['upside_from_price_pct']:+.1f}% from the latest close)."
                     )
                 if darvas:
                     st.info(
