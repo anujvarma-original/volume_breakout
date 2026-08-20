@@ -1671,6 +1671,8 @@ def find_prior_resistance_levels(
     cluster_pct: float = 2.0,
 ) -> list[float]:
     """Find clustered historical swing highs above the current price."""
+    # Use a consistent 2-year resistance discovery window (~504 trading sessions).
+    df = df.tail(504).copy()
     if not box_result.get("valid"):
         return []
 
@@ -2556,24 +2558,22 @@ def send_daily_scan_email(
                     f"{format_currency(safe_float(target.get('price')))} "
                     f"({safe_float(target.get('upside_from_price_pct')):+.1f}%)"
                 )
+
                 if target.get("type") == "Prior swing resistance":
                     rs = safe_float(target.get("resistance_strength_score"))
                     rb = safe_float(target.get("resistance_break_score"))
-                    tests = int(safe_float(target.get("resistance_tests"), 0))
-                    rejection = safe_float(target.get("resistance_avg_rejection_pct"))
+
                     if np.isfinite(rs):
                         target_line += (
                             f" | Strength {rs:.0f}/100 "
-                            f"({target.get('resistance_strength_label','N/A')})"
+                            f"({target.get('resistance_strength_label', 'N/A')})"
                         )
                     if np.isfinite(rb):
                         target_line += (
                             f" | Break Score {rb:.0f}/100 "
-                            f"({target.get('resistance_break_label','N/A')})"
+                            f"({target.get('resistance_break_label', 'N/A')})"
                         )
-                    target_line += f" | Tests {tests}"
-                    if np.isfinite(rejection):
-                        target_line += f" | Avg rejection {rejection:.1f}%"
+
                 lines.append(target_line)
             lines.append("")
 
@@ -2590,28 +2590,30 @@ def send_daily_scan_email(
                 f"Volume {r['Volume Multiple']:.2f}x | "
                 f"Momentum Range {format_currency(safe_float(r.get('Momentum Low Target')))} to {format_currency(safe_float(r.get('Momentum High Target')))}"
             )
+
             for target in [
                 t for t in r.get("Targets", [])
                 if t.get("type") == "Prior swing resistance"
             ][:2]:
-                rs = safe_float(target.get("resistance_strength_score"))
-                rb = safe_float(target.get("resistance_break_score"))
                 target_line = (
-                    f"  - {target.get('name','Resistance')}: "
+                    f"  - {target.get('name', 'Resistance')}: "
                     f"{format_currency(safe_float(target.get('price')))} "
                     f"({safe_float(target.get('upside_from_price_pct')):+.1f}%)"
                 )
+                rs = safe_float(target.get("resistance_strength_score"))
+                rb = safe_float(target.get("resistance_break_score"))
                 if np.isfinite(rs):
                     target_line += (
                         f" | Strength {rs:.0f}/100 "
-                        f"({target.get('resistance_strength_label','N/A')})"
+                        f"({target.get('resistance_strength_label', 'N/A')})"
                     )
                 if np.isfinite(rb):
                     target_line += (
                         f" | Break Score {rb:.0f}/100 "
-                        f"({target.get('resistance_break_label','N/A')})"
+                        f"({target.get('resistance_break_label', 'N/A')})"
                     )
                 lines.append(target_line)
+
         lines.append("")
 
     lines += ["Educational signals only; not investment advice."]
@@ -2735,43 +2737,21 @@ def run_daily_market_scan(
             target_data = calculate_breakout_targets(asset_df, target_structure)
             scored_targets = target_data.get("targets", [])
 
-            # Add structural resistance strength to genuine historical resistance
-            # levels only. ATR and Darvas projected targets are left untouched.
-            batch_momentum_box = {
-                "available": True,
-                "score": safe_float(r.get("Momentum Box Score"), 0.0),
-                "trajectory": r.get("Momentum Box Trajectory", "CURRENT"),
-            }
-            batch_momentum_compression = {
-                "available": True,
-                "score": safe_float(r.get("Momentum Compression Score"), 0.0),
-                "bias": r.get("Momentum Compression Bias", "NEUTRAL"),
-            }
             for target in scored_targets:
                 if target.get("type") != "Prior swing resistance":
                     continue
-                resistance_strength = evaluate_resistance_strength(
+
+                rs = evaluate_resistance_strength(
                     asset_df,
                     safe_float(target.get("price")),
                     current_price=safe_float(r.get("Price")),
                 )
-                resistance_break = calculate_resistance_break_score(
-                    resistance_strength,
-                    batch_momentum_box,
-                    batch_momentum_compression,
-                    squeeze_score=np.nan,  # squeeze enrichment occurs immediately below
-                    volume_multiple=safe_float(r.get("Volume Multiple")),
-                )
-                target["resistance_strength_score"] = safe_float(resistance_strength.get("score"))
-                target["resistance_strength_label"] = resistance_strength.get("label", "N/A")
-                target["resistance_tests"] = resistance_strength.get("tests", 0)
+                target["resistance_strength_score"] = safe_float(rs.get("score"))
+                target["resistance_strength_label"] = rs.get("label", "N/A")
+                target["resistance_tests"] = rs.get("tests", 0)
                 target["resistance_avg_rejection_pct"] = safe_float(
-                    resistance_strength.get("avg_rejection_pct")
+                    rs.get("avg_rejection_pct")
                 )
-                target["resistance_break_score_pre_squeeze"] = safe_float(
-                    resistance_break.get("score")
-                )
-                target["resistance_break_label_pre_squeeze"] = resistance_break.get("label", "N/A")
 
             r["Targets"] = scored_targets
 
@@ -2784,37 +2764,43 @@ def run_daily_market_scan(
         r["Squeeze Bonus"] = bonus
         r["Strategy Score"] = min(100, core + bonus)
 
-        # Now that squeeze data is available, finalize resistance break scores.
-        final_momentum_box = {
+        batch_momentum_box = {
             "available": True,
             "score": safe_float(r.get("Momentum Box Score"), 0.0),
             "trajectory": r.get("Momentum Box Trajectory", "CURRENT"),
         }
-        final_momentum_compression = {
+        batch_momentum_compression = {
             "available": True,
             "score": safe_float(r.get("Momentum Compression Score"), 0.0),
             "bias": r.get("Momentum Compression Bias", "NEUTRAL"),
         }
+
         for target in r.get("Targets", []):
             if target.get("type") != "Prior swing resistance":
                 continue
-            resistance_proxy = {
-                "available": True,
+
+            rs_proxy = {
+                "available": np.isfinite(
+                    safe_float(target.get("resistance_strength_score"))
+                ),
                 "score": safe_float(target.get("resistance_strength_score")),
                 "label": target.get("resistance_strength_label", "N/A"),
                 "tests": target.get("resistance_tests", 0),
-                "avg_rejection_pct": safe_float(target.get("resistance_avg_rejection_pct")),
+                "avg_rejection_pct": safe_float(
+                    target.get("resistance_avg_rejection_pct")
+                ),
                 "distance_pct": safe_float(target.get("upside_from_price_pct")),
             }
-            final_break = calculate_resistance_break_score(
-                resistance_proxy,
-                final_momentum_box,
-                final_momentum_compression,
+
+            rb = calculate_resistance_break_score(
+                rs_proxy,
+                batch_momentum_box,
+                batch_momentum_compression,
                 squeeze_score=safe_float(r.get("Short Squeeze Potential")),
                 volume_multiple=safe_float(r.get("Volume Multiple")),
             )
-            target["resistance_break_score"] = safe_float(final_break.get("score"))
-            target["resistance_break_label"] = final_break.get("label", "N/A")
+            target["resistance_break_score"] = safe_float(rb.get("score"))
+            target["resistance_break_label"] = rb.get("label", "N/A")
 
         mcomp = safe_float(r.get("Momentum Compression Score"), 0.0)
         mbox = safe_float(r.get("Momentum Box Score"), 0.0)
@@ -3702,58 +3688,66 @@ def main() -> None:
         momentum_compression.get("bias", "NEUTRAL"),
     )
 
-    # Compact resistance dashboard for the currently selected ticker.
-    # Uses the same historical resistance levels and scoring already shown
-    # in the Breakout Forecast tab; no additional market-data calls are made.
-    resistance_targets = [
-        t for t in breakout_targets.get("targets", [])
-        if t.get("type") == "Prior swing resistance"
-    ][:2]
-    if resistance_targets:
-        st.markdown("### 🧱 Resistance Dashboard")
-        resistance_cols = st.columns(len(resistance_targets))
-        for idx, target in enumerate(resistance_targets):
-            level = safe_float(target.get("price"))
-            resistance_strength = evaluate_resistance_strength(
-                asset_df,
-                level,
-                current_price=safe_float(box_result.get("latest_close")),
-            )
-            resistance_break = calculate_resistance_break_score(
-                resistance_strength,
-                momentum_box,
-                momentum_compression,
-                squeeze_score=safe_float(squeeze_snapshot.get("score"))
-                if squeeze_snapshot.get("available") else np.nan,
-                volume_multiple=safe_float(box_result.get("volume_multiple")),
-            )
-            room = safe_float(target.get("upside_from_price_pct"))
-            rs_score = safe_float(resistance_strength.get("score"))
-            rb_score = safe_float(resistance_break.get("score"))
-            tests = int(safe_float(resistance_strength.get("tests"), 0))
-            rejection = safe_float(resistance_strength.get("avg_rejection_pct"))
+    # Resistance summary is intentionally isolated so a resistance-rendering
+    # problem can never prevent the rest of the Streamlit UI from loading.
+    try:
+        resistance_targets = [
+            t for t in breakout_targets.get("targets", [])
+            if t.get("type") == "Prior swing resistance"
+        ][:2]
 
-            with resistance_cols[idx]:
-                st.markdown(f"#### {target.get('name', f'R{idx+1}')}")
-                st.metric(
-                    "Resistance",
-                    format_currency(level),
-                    f"{room:+.1f}% room" if np.isfinite(room) else None,
+        if resistance_targets:
+            st.markdown("### 🧱 Resistance Dashboard")
+            resistance_cols = st.columns(len(resistance_targets))
+
+            for idx, target in enumerate(resistance_targets):
+                level = safe_float(target.get("price"))
+                rs = evaluate_resistance_strength(
+                    asset_df,
+                    level,
+                    current_price=safe_float(box_result.get("latest_close")),
                 )
-                st.metric(
-                    "Strength",
-                    f"{rs_score:.0f}/100" if np.isfinite(rs_score) else "N/A",
-                    resistance_strength.get("label", "N/A"),
+                rb = calculate_resistance_break_score(
+                    rs,
+                    momentum_box,
+                    momentum_compression,
+                    squeeze_score=(
+                        safe_float(squeeze_snapshot.get("score"))
+                        if squeeze_snapshot.get("available")
+                        else np.nan
+                    ),
+                    volume_multiple=safe_float(box_result.get("volume_multiple")),
                 )
-                st.metric(
-                    "Break Score",
-                    f"{rb_score:.0f}/100" if np.isfinite(rb_score) else "N/A",
-                    resistance_break.get("label", "N/A"),
-                )
-                detail = f"{tests} prior test{'s' if tests != 1 else ''}"
-                if np.isfinite(rejection):
-                    detail += f" · avg rejection {rejection:.1f}%"
-                st.caption(detail)
+
+                room = safe_float(target.get("upside_from_price_pct"))
+                tests = rs.get("tests", 0)
+                rejection = safe_float(rs.get("avg_rejection_pct"))
+
+                with resistance_cols[idx]:
+                    st.markdown(f"#### {target.get('name', f'R{idx+1}')}")
+                    st.metric(
+                        "Resistance",
+                        format_currency(level),
+                        f"{room:+.1f}% room" if np.isfinite(room) else None,
+                    )
+                    st.write(
+                        f"**Strength:** {safe_float(rs.get('score')):.0f}/100 "
+                        f"({rs.get('label', 'N/A')})"
+                        if np.isfinite(safe_float(rs.get("score")))
+                        else "**Strength:** N/A"
+                    )
+                    st.write(
+                        f"**Break Score:** {safe_float(rb.get('score')):.0f}/100 "
+                        f"({rb.get('label', 'N/A')})"
+                        if np.isfinite(safe_float(rb.get("score")))
+                        else "**Break Score:** N/A"
+                    )
+                    detail = f"{tests} prior test{'s' if tests != 1 else ''}"
+                    if np.isfinite(rejection):
+                        detail += f" · avg rejection {rejection:.1f}%"
+                    st.caption(detail)
+    except Exception as resistance_ui_error:
+        st.caption("Resistance dashboard unavailable for this ticker.")
 
     tabs = st.tabs(
         [
