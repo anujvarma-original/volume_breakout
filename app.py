@@ -3774,7 +3774,17 @@ def main() -> None:
         ticker,
         "BTC-USD" if ticker.endswith("-USD") else ACTIVE_BENCHMARK,
     )
-    squeeze_snapshot = fetch_short_squeeze_snapshot(ticker, asset_df)
+    # Keep ticker switching responsive: do not block the single-ticker UI on Yahoo fundamentals.
+    # Reuse a cached snapshot if this ticker was already enriched during this session; otherwise
+    # show the core technical score and let the dedicated Short Squeeze panel fetch on demand.
+    _sq_cache = st.session_state.setdefault("interactive_squeeze_cache", {})
+    squeeze_snapshot = _sq_cache.get(ticker, {
+        "applicable": not (ticker.endswith("-USD") or ticker in {"SPY","QQQ","DIA","IWM","MDY","RSP"}),
+        "available": False,
+        "score": np.nan,
+        "label": "N/A",
+        "components": {},
+    })
     score = calculate_score_with_squeeze(core_score, squeeze_snapshot)
 
     breakout_probability = (
